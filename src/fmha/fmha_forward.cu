@@ -736,48 +736,39 @@ int main(int argc, char **argv) {
   if (argc >= 3)
     sscanf(argv[2], "%d", &m);
 
-  int n = 4096;
-  if (argc >= 4)
-    sscanf(argv[3], "%d", &n);
-
   int k = 2048;
-  if (argc >= 5)
-    sscanf(argv[4], "%d", &k);
+  if (argc >= 4)
+    sscanf(argv[3], "%d", &k);
 
   int batchSize = 1;
-  if (argc >= 6)
-    sscanf(argv[5], "%d", &batchSize);
+  if (argc >= 5)
+    sscanf(argv[4], "%d", &batchSize);
 
   int iterations = 10;
-  if (argc >= 7)
-    sscanf(argv[6], "%d", &iterations);
+  if (argc >= 6)
+    sscanf(argv[5], "%d", &iterations);
 
   int warmup_iterations = 1;
-  if (argc >= 8)
-    sscanf(argv[7], "%d", &warmup_iterations);
+  if (argc >= 7)
+    sscanf(argv[6], "%d", &warmup_iterations);
 
   bool printValues = false;
-  if (argc >= 9)
-    sscanf(argv[8], "%d", &printValues);
+  if (argc >= 8)
+    sscanf(argv[7], "%d", &printValues);
 
   int nStreams = 1;
-  if (argc >= 10)
-    sscanf(argv[9], "%d", &nStreams);
+  if (argc >= 9)
+    sscanf(argv[8], "%d", &nStreams);
 
   int numHeads = k / kHeadSize;
-
   if (type == 1) {
-    //    testFmhaForward<float, float, float, float>(
-    //        m, n, kHeadSize, numHeads, batchSize, warmup_iterations,
-    //        iterations,
-    //       printValues, nStreams);
-  } else if (type == 2) {
+    int n = m;
     testFmhaForward<cutlass::half_t, cutlass::half_t, cutlass::half_t,
                     cutlass::half_t>(m, n, kHeadSize, numHeads, batchSize,
                                      warmup_iterations, iterations, printValues,
                                      nStreams);
   } else {
-    std::cout << "invalid type value (1 | 2 | 3 are the only legal values)";
+    std::cout << "invalid type value (1 (fp16) is the only legal values)";
     exit(-1);
   }
 

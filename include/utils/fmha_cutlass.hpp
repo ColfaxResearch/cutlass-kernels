@@ -194,8 +194,6 @@ public:
     cutlass::DeviceAllocation<ElementP> softmaxP(layout_P.capacity(extent_P));
     cutlass::TensorView<ElementP, LayoutP> softmaxViewP(softmaxP.get(),
                                                         layout_P, extent_P);
-    std::cout << problem0 << ldq << " " << ldk << " " << ldp << " " << ldv
-              << " " << ldo << std::endl;
     for (int64_t b = 0; b < batch_size; ++b) {
 
       for (int64_t h = 0; h < head_number; ++h) {
