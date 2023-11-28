@@ -1,6 +1,6 @@
-# CUTLASS Kernels
+# FMHA
 
-Library of CUTLASS kernels targeting Large Language Models (LLM).
+An implementation of Flash Multi Head Attention (FMHA) algorithm usint CUTLASS/CuTe for SM90.
 
 # Building and Running.
 
