@@ -1,6 +1,6 @@
 # FMHA
 
-An implementation of Flash Multi Head Attention (FMHA) algorithm usint CUTLASS/CuTe for SM90.
+An implementation of Flash Multi Head Attention (FMHA) algorithm using CUTLASS/CuTe for SM90.
 
 # Building and Running.
 
