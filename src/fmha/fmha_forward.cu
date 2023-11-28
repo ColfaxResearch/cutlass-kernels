@@ -35,18 +35,6 @@ constexpr int kKeysPerBlock = KBLKSIZE;
 constexpr int kKeysPerBlock = 64;
 #endif
 
-#ifdef HEAD
-constexpr int kHeadSize = HEAD;
-#else
-constexpr int kHeadSize = 64;
-#endif
-
-constexpr int kT = kHeadSize;
-
-constexpr float kLog2e = 1.4426950408889634074; // log_2(e) = M_LOG2E
-const float softmax_scale = (1.0f / sqrt(float(kHeadSize)));
-const float scale = softmax_scale * kLog2e;
-
 template <class ElementType, class SmemLayoutQ, class SmemLayoutK,
           class SmemLayoutS, class SmemLayoutV>
 struct SharedStorage {
@@ -139,7 +127,6 @@ fmhaForward(TA const *Q, CUTE_GRID_CONSTANT TiledCopyA const tmaLoadQ,
             GmemLayoutMI gmemLayoutMi, float scale) {
 
   using namespace cute;
-  using X = Underscore;
   CUTE_STATIC_ASSERT_V(product_each(shape(tileShapeQ)) ==
                        product_each(shape(smemLayoutQ)));
 
@@ -153,7 +140,6 @@ fmhaForward(TA const *Q, CUTE_GRID_CONSTANT TiledCopyA const tmaLoadQ,
 
   // Shared memory barriers use 64bits in SMEM for synchronization
   uint64_t *tma_load_mbar = shared_storage.tma_load_mbar;
-  uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
 
   auto blockIdxX = uint64_t(blockIdx.x);
   auto blockIdxH = uint64_t(blockIdx.y);
@@ -359,13 +345,12 @@ fmhaForward(TA const *Q, CUTE_GRID_CONSTANT TiledCopyA const tmaLoadQ,
   __syncthreads();
 }
 
-template <typename TA, typename TB, typename TC, typename Alpha, typename Beta,
-          typename AccumType>
-void fmhaForwardDevice(int SEQLEN, int KEYLEN, int HEADDIM, int NUMHEADS,
-                       int BATCH, Alpha alpha, TA const *tensorQ,
-                       TB const *tensorK, Beta beta, TC *tensorV, TC *tensorS,
-                       TC *tensorO, AccumType *miOut, AccumType *sPrimeOut,
-                       int iterations, cudaStream_t stream = 0) {
+template <typename PrecType, typename AccumType, int HEADDIM>
+void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
+                       PrecType const *tensorQ, PrecType const *tensorK,
+                       PrecType *tensorV, PrecType *tensorS, PrecType *tensorO,
+                       AccumType *miOut, AccumType *sPrimeOut, int iterations,
+                       float scale, cudaStream_t stream = 0) {
   using namespace cute;
 
   // Define shapes (dynamic)
@@ -379,10 +364,11 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int HEADDIM, int NUMHEADS,
   // Define TileShapes
   using bM = Int<kQueriesPerBlock>;
   using bN = Int<kKeysPerBlock>;
-  using bK = Int<kT>;
+  using bK = Int<HEADDIM>;
 
-  using MmaA = cute::conditional_t<cute::is_same_v<TA, float>, tfloat32_t, TA>;
-  using MmaB = cute::conditional_t<cute::is_same_v<TB, float>, tfloat32_t, TB>;
+  using MmaA = cute::conditional_t<cute::is_same_v<PrecType, float>, tfloat32_t,
+                                   PrecType>;
+  using MmaB = MmaA;
   using MmaC = AccumType;
 
   // k-major for Q.
@@ -476,11 +462,11 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int HEADDIM, int NUMHEADS,
       TiledMma0, TiledMma1, ClusterShape, MmaA, decltype(tmaQ),
       decltype(tileShapeQ), decltype(gmemLayoutQ), decltype(smemLayoutQ), MmaB,
       decltype(tmak), decltype(tileShapeK), decltype(gmemLayoutK),
-      decltype(smemLayoutK), TC, decltype(tileShapeS), decltype(gmemLayoutS),
-      decltype(smemLayoutS), decltype(tmaV), decltype(tileShapeV),
-      decltype(gmemLayoutV), decltype(smemLayoutV), decltype(smemLayoutVt),
-      decltype(tileShapeO), decltype(gmemLayoutO), decltype(gmemLayoutMi),
-      AccumType>;
+      decltype(smemLayoutK), PrecType, decltype(tileShapeS),
+      decltype(gmemLayoutS), decltype(smemLayoutS), decltype(tmaV),
+      decltype(tileShapeV), decltype(gmemLayoutV), decltype(smemLayoutV),
+      decltype(smemLayoutVt), decltype(tileShapeO), decltype(gmemLayoutO),
+      decltype(gmemLayoutMi), AccumType>;
   cfk::utils::set_smem_size(smem_size, kernel);
 
   dim3 block_dims(size(TiledMma0{}));
@@ -503,16 +489,17 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int HEADDIM, int NUMHEADS,
   }
 }
 
-template <typename TA, typename TB, typename TC, typename Alpha, typename Beta,
-          typename AccumType>
-void fmhaForwardDeviceLoop(int SEQLEN, int KEYLEN, int HEADDIM, int NUMHEADS,
-                           int BATCHSIZE, Alpha alpha, TA const *A, TB const *B,
-                           Beta beta, TC *V, TC *Q, TC *D, AccumType *miOut,
-                           AccumType *sPrimeOut, int iterations, int nStreams) {
+template <typename PrecType, typename AccumType, int HEADDIM>
+void fmhaForwardDeviceLoop(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCHSIZE,
+                           PrecType const *A, PrecType const *B, PrecType *V,
+                           PrecType *Q, PrecType *D, AccumType *miOut,
+                           AccumType *sPrimeOut, int iterations, int nStreams,
+                           float scale) {
 
   if (nStreams == 1) {
-    fmhaForwardDevice(SEQLEN, KEYLEN, HEADDIM, NUMHEADS, BATCHSIZE, alpha, A, B,
-                      beta, V, Q, D, miOut, sPrimeOut, iterations);
+    fmhaForwardDevice<PrecType, AccumType, HEADDIM>(
+        SEQLEN, KEYLEN, NUMHEADS, BATCHSIZE, A, B, V, Q, D, miOut, sPrimeOut,
+        iterations, scale);
     return;
   } else {
     auto L = BATCHSIZE / nStreams;
@@ -527,10 +514,10 @@ void fmhaForwardDeviceLoop(int SEQLEN, int KEYLEN, int HEADDIM, int NUMHEADS,
       auto offsetD = i * SEQLEN * HEADDIM * L;
       auto miOffset = i * SEQLEN * L;
 
-      fmhaForwardDevice(SEQLEN, KEYLEN, HEADDIM, NUMHEADS, L, alpha,
-                        A + offsetA, B + offsetB, beta, V + offsetV,
-                        Q + offsetQ, D + offsetD, miOut + miOffset,
-                        sPrimeOut + miOffset, iterations, stream);
+      fmhaForwardDevice<PrecType, AccumType, HEADDIM>(
+          SEQLEN, KEYLEN, NUMHEADS, L, A + offsetA, B + offsetB, V + offsetV,
+          Q + offsetQ, D + offsetD, miOut + miOffset, sPrimeOut + miOffset,
+          iterations, scale, stream);
     }
   }
 }
@@ -539,13 +526,15 @@ void fmhaForwardDeviceLoop(int SEQLEN, int KEYLEN, int HEADDIM, int NUMHEADS,
 #include <cstdio>
 #include <cstdlib>
 
-template <typename TA, typename TB, typename TC, typename TI>
-void testFmhaForward(int m, int n, int k, int numHeads, int batchSize,
-                     int iterations, bool refCheck, bool printValues,
-                     int nStreams) {
+template <typename PrecType, int HEADDIM>
+void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
+                     bool refCheck, bool printValues, int nStreams) {
+  constexpr float kLog2e = 1.4426950408889634074; // log_2(e) = M_LOG2E
+  const float softmax_scale = (1.0f / sqrt(float(HEADDIM)));
+  const float scale = softmax_scale * kLog2e;
   cudaDeviceReset();
   cute::device_init(0);
-
+  int k = HEADDIM;
   std::cout << "M = " << m << std::endl;
   std::cout << "N = " << n << std::endl;
   std::cout << "K = " << k << std::endl;
@@ -559,11 +548,11 @@ void testFmhaForward(int m, int n, int k, int numHeads, int batchSize,
   std::cout << "L = " << lLong << " : " << numHeads << " * " << batchSize
             << std::endl;
 
-  thrust::device_vector<TA> devQ(mLong * kLong * lLong);
-  thrust::device_vector<TB> devK(nLong * kLong * lLong);
-  thrust::device_vector<TC> devS(mLong * nLong * lLong);
-  thrust::device_vector<TC> devV(nLong * kLong * lLong);
-  thrust::device_vector<TC> devD(mLong * kLong * lLong);
+  thrust::device_vector<PrecType> devQ(mLong * kLong * lLong);
+  thrust::device_vector<PrecType> devK(nLong * kLong * lLong);
+  thrust::device_vector<PrecType> devS(mLong * nLong * lLong);
+  thrust::device_vector<PrecType> devV(nLong * kLong * lLong);
+  thrust::device_vector<PrecType> devD(mLong * kLong * lLong);
 
   uint32_t seed = 3080;
 
@@ -583,22 +572,19 @@ void testFmhaForward(int m, int n, int k, int numHeads, int batchSize,
   cfk::initialize_rand(devQ.data().get(), devQ.size(), initQ, seed + 1);
   cfk::initialize_rand(devK.data().get(), devK.size(), initK, seed + 2);
   cfk::initialize_rand(devV.data().get(), devV.size(), initV, seed + 3);
-  cfk::initialize_const(devS.data().get(), devS.size(), TC(-1));
-  cfk::initialize_const(devD.data().get(), devD.size(), TC(-1));
+  cfk::initialize_const(devS.data().get(), devS.size(), PrecType(-1));
+  cfk::initialize_const(devD.data().get(), devD.size(), PrecType(-1));
 
   using AccumType = float; // AccumType is always float.
 
-  thrust::host_vector<TA> hostQ = devQ;
-  thrust::host_vector<TB> hostK = devK;
-  thrust::host_vector<TC> hostS = devS;
-  thrust::host_vector<TB> hostV = devV;
-  thrust::host_vector<TC> hostD = devD;
+  thrust::host_vector<PrecType> hostQ = devQ;
+  thrust::host_vector<PrecType> hostK = devK;
+  thrust::host_vector<PrecType> hostS = devS;
+  thrust::host_vector<PrecType> hostV = devV;
+  thrust::host_vector<PrecType> hostD = devD;
 
   thrust::device_vector<AccumType> devMiOut(mLong * lLong);
   thrust::device_vector<AccumType> devSprimeOut(mLong * lLong);
-
-  TI alpha = TI(1.0);
-  TI beta = TI(0.0);
 
   const int timing_iterations = iterations;
   GPU_Clock timer;
@@ -628,10 +614,10 @@ void testFmhaForward(int m, int n, int k, int numHeads, int batchSize,
   devS = hostS;
   devD = hostD;
   devV = hostV;
-  fmhaForwardDeviceLoop(
-      m, n, k, numHeads, batchSize, alpha, devQ.data().get(), devK.data().get(),
-      beta, devV.data().get(), devS.data().get(), devD.data().get(),
-      devMiOut.data().get(), devSprimeOut.data().get(), 10, nStreams);
+  fmhaForwardDeviceLoop<PrecType, AccumType, HEADDIM>(
+      m, n, numHeads, batchSize, devQ.data().get(), devK.data().get(),
+      devV.data().get(), devS.data().get(), devD.data().get(),
+      devMiOut.data().get(), devSprimeOut.data().get(), 10, nStreams, scale);
   CUTE_CHECK_LAST();
 
   // Timing iterations
@@ -639,18 +625,19 @@ void testFmhaForward(int m, int n, int k, int numHeads, int batchSize,
   devD = hostD;
   devV = hostV;
   timer.start();
-  fmhaForwardDeviceLoop(
-      m, n, k, numHeads, batchSize, alpha, devQ.data().get(), devK.data().get(),
-      beta, devV.data().get(), devS.data().get(), devD.data().get(),
-      devMiOut.data().get(), devSprimeOut.data().get(), iterations, nStreams);
+  fmhaForwardDeviceLoop<PrecType, AccumType, HEADDIM>(
+      m, n, numHeads, batchSize, devQ.data().get(), devK.data().get(),
+      devV.data().get(), devS.data().get(), devD.data().get(),
+      devMiOut.data().get(), devSprimeOut.data().get(), iterations, nStreams,
+      scale);
   double cute_time = timer.seconds() / timing_iterations;
   CUTE_CHECK_LAST();
   printf("CUTE_GEMM:     [%6.1f]GFlop/s(CUTLASS) [%6.1f]Gflop/s(FLASH2)  "
          "(%6.4f)ms\n",
          cutlass_flops / cute_time, flash2_flops / cute_time, cute_time * 1000);
 
-  thrust::host_vector<TC> cute_result_S = devS;
-  thrust::host_vector<TC> cute_result_D = devD;
+  thrust::host_vector<PrecType> cute_result_S = devS;
+  thrust::host_vector<PrecType> cute_result_D = devD;
   thrust::host_vector<AccumType> miHostOut = devMiOut;
   thrust::host_vector<AccumType> sPrimeHostOut = devSprimeOut;
   thrust::host_vector<AccumType> miRefHostOut(miHostOut.size());
@@ -660,15 +647,15 @@ void testFmhaForward(int m, int n, int k, int numHeads, int batchSize,
   bool usePow2 = false;
 
   if (refCheck) {
-    TestAttention<TC, AccumType> testBed(numHeads, batchSize, k, m);
+    TestAttention<PrecType, AccumType> testBed(numHeads, batchSize, k, m);
     testBed.initialize();
     devD = hostD;
     devS = hostS;
     testBed.compute(devQ.data().get(), devK.data().get(), devV.data().get(),
                     devS.data().get(), devD.data().get(), miRefHostOut.data(),
                     sPrimeRefHostOut.data(), usePow2, usePreScaling);
-    thrust::host_vector<TC> cublas_result_S = devS;
-    thrust::host_vector<TC> cublas_result_D = devD;
+    thrust::host_vector<PrecType> cublas_result_S = devS;
+    thrust::host_vector<PrecType> cublas_result_D = devD;
 
 #ifdef COPYOUTMM0
     // Our intermediate write to S is unscaled. So scale it before checking with
@@ -685,8 +672,8 @@ void testFmhaForward(int m, int n, int k, int numHeads, int batchSize,
 #endif
 
 #ifdef COPYOUTMI
-    // Our intermediate write to MI is scaled with log2e. So un-scale it before checking
-    // with CUTLASS.
+    // Our intermediate write to MI is scaled with log2e. So un-scale it before
+    // checking with CUTLASS.
     if (!usePow2) {
       for (int j = 0; j < miHostOut.size(); ++j) {
         miHostOut[j] = miHostOut[j] * (1.0 / kLog2e);
@@ -724,7 +711,10 @@ void print_usage() {
          "statement.\n\n"
       << "  --batch-size=<int>          Batch size in multi-head attention "
          "(default: --batch_size=16).\n"
-      << "  --dim-size=<int>            Size of the head dimension. \n"
+      << "  --dim-size=<int>            Full Size of the head dimension "
+         "(before reshape). \n"
+      << "  --head-size=<int>           Size of the head dimension (after "
+         "reshape). \n"
       << "  --seq-length=<int>          Sequence length in multi-head "
          "attention for Q (default: --seq_length=1024).\n"
       << "  --iterations=<int>          Number of profiling iterations to "
@@ -745,10 +735,11 @@ int main(int argc, char const **argv) {
     return;
   }
 
-  int seqLength, batchSize, dimSize, iterations, nStreams;
+  int seqLength, batchSize, dimSize, iterations, nStreams, kHeadSize;
   bool refCheck, printValues;
   cmd.get_cmd_line_argument("batch-size", batchSize, 16);
   cmd.get_cmd_line_argument("dim-size", dimSize, 2048);
+  cmd.get_cmd_line_argument("head-size", kHeadSize, 64);
   cmd.get_cmd_line_argument("seq-length", seqLength, 1024);
   cmd.get_cmd_line_argument("iterations", iterations, 20);
   cmd.get_cmd_line_argument("num-cuda-streams", nStreams, 1);
@@ -757,10 +748,22 @@ int main(int argc, char const **argv) {
 
   int numHeads = dimSize / kHeadSize;
 
-  testFmhaForward<cutlass::half_t, cutlass::half_t, cutlass::half_t,
-                  cutlass::half_t>(seqLength, seqLength, kHeadSize, numHeads,
-                                   batchSize, iterations, refCheck, printValues,
-                                   nStreams);
+  if (kHeadSize == 64) {
+    testFmhaForward<cutlass::half_t, 64>(seqLength, seqLength, numHeads,
+                                         batchSize, iterations, refCheck,
+                                         printValues, nStreams);
+  } else if (kHeadSize == 128) {
+    testFmhaForward<cutlass::half_t, 128>(seqLength, seqLength, numHeads,
+                                          batchSize, iterations, refCheck,
+                                          printValues, nStreams);
+  } else if (kHeadSize == 256) {
+    testFmhaForward<cutlass::half_t, 256>(seqLength, seqLength, numHeads,
+                                          batchSize, iterations, refCheck,
+                                          printValues, nStreams);
+  } else {
+    std::cout << "Unsupported head dim: " << kHeadSize << std::endl;
+    exit(-1);
+  }
 
   return 0;
 }
