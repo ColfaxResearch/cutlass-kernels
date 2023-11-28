@@ -718,7 +718,7 @@ void testFmhaForward(int m, int n, int k, int numHeads, int batchSize,
 void print_usage() {
 
   std::cout
-      << "fmha_forward"
+      << "fmha_forward "
       << "Options:\n\n"
       << "  --help                      If specified, displays this usage "
          "statement.\n\n"
