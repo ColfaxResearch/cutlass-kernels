@@ -175,8 +175,6 @@ public:
                ElementS *S, ElementO *O, ElementNorm *norm, ElementSum *sum,
                bool usePow2 = false, bool usePreScaling = true) {
 
-    bool passed = true;
-
     LayoutQ layout_Q(ldq);
     LayoutK layout_K(ldk);
     LayoutP layout_P(ldp);

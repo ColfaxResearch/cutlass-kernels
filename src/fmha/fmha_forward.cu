@@ -193,7 +193,6 @@ fmhaForward(TA const *Q, CUTE_GRID_CONSTANT TiledCopyA const tmaLoadQ,
   Tensor mO = make_tensor(make_gmem_ptr(O), gmemLayoutO);
   auto blkCoordQ = make_coord(blockIdxX, 0, blockIdxH, blockIdxB);
 
-  constexpr int R = rank_v<TileShapeA>;
   Tensor gQ = local_tile(mQ, tileShapeQ, blkCoordQ);
   //
   // Prepare the TMA_LOAD for A
@@ -278,7 +277,6 @@ fmhaForward(TA const *Q, CUTE_GRID_CONSTANT TiledCopyA const tmaLoadQ,
 #pragma unroll
   for (uint64_t blockIdxY = 0; blockIdxY < nTilesOfK; ++blockIdxY) {
 
-    constexpr int RV = rank_v<TileShapeB>;
     auto blkCoordV = make_coord(blockIdxY, 0, blockIdxH, blockIdxB);
     Tensor gV = local_tile(mV, tileShapeV, blkCoordV);
 
@@ -298,8 +296,6 @@ fmhaForward(TA const *Q, CUTE_GRID_CONSTANT TiledCopyA const tmaLoadQ,
     Tensor tSgS = threadMma0.partition_C(gS);
     copy(tSrS, tSgS);
 #endif
-
-#ifdef FMHA
 
     if (blockIdxY != (nTilesOfK - 1)) {
       auto blkCoordK = make_coord(blockIdxY + 1, 0, blockIdxH, blockIdxB);
@@ -331,11 +327,8 @@ fmhaForward(TA const *Q, CUTE_GRID_CONSTANT TiledCopyA const tmaLoadQ,
                        tma_load_mbar[1]);
 #endif
 #endif
-
-#endif /* FMHA */
   }
 
-#ifdef FMHA
 #ifdef COPYOUTMI
   if (threadIdx.x % 4 == 0) {
     auto mmaThreadLayoutC = TiledMma0{}.get_layoutC_TV();
@@ -361,11 +354,7 @@ fmhaForward(TA const *Q, CUTE_GRID_CONSTANT TiledCopyA const tmaLoadQ,
   applySoftmaxNormalizer<AccumType>(rowSum, tOrO);
 #endif
 
-#ifndef NOCOPYOUTMM1
   copy(tOrO, tOgO);
-#endif
-
-#endif
 
   __syncthreads();
 }
@@ -441,10 +430,6 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int HEADDIM, int NUMHEADS,
 
   // Layout for Vtranspose. For using in GMMA.
   auto tileShapeVt = make_shape(bK{}, bN{});
-  // auto smemLayoutVt =
-  //	  tile_to_shape(GMMA::Layout_MN_SW128_Atom<MmaB>{}, tileShapeVt);
-  // auto smemLayoutVAtom  = composition(Swizzle<3, 3, 3>{},
-  // Layout<Shape<Int<bK{}>, Int<bN{}>>, Stride<_1, Int<bK{}>>>{});
   using SmemLayoutVAtomBits =
       ComposedLayout<Swizzle<3, 4, 3>, smem_ptr_flag,
                      Layout<Shape<_1024, Int<bN{}>>, Stride<_1, _1024>>>;
@@ -556,7 +541,7 @@ void fmhaForwardDeviceLoop(int SEQLEN, int KEYLEN, int HEADDIM, int NUMHEADS,
 
 template <typename TA, typename TB, typename TC, typename TI>
 void testFmhaForward(int m, int n, int k, int numHeads, int batchSize,
-                     int warmup_iterations, int iterations, bool printValues,
+                     int iterations, bool refCheck, bool printValues,
                      int nStreams) {
   cudaDeviceReset();
   cute::device_init(0);
@@ -581,16 +566,20 @@ void testFmhaForward(int m, int n, int k, int numHeads, int batchSize,
   thrust::device_vector<TC> devD(mLong * kLong * lLong);
 
   uint32_t seed = 3080;
-#ifndef NOVERIFY
-  //#ifdef UNIFORM
-  cutlass::Distribution::Kind initQ = cutlass::Distribution::Uniform;
-  cutlass::Distribution::Kind initK = cutlass::Distribution::Uniform;
-  cutlass::Distribution::Kind initV = cutlass::Distribution::Uniform;
-#else
-  cutlass::Distribution::Kind initQ = cutlass::Distribution::Gaussian;
-  cutlass::Distribution::Kind initK = cutlass::Distribution::Gaussian;
-  cutlass::Distribution::Kind initV = cutlass::Distribution::Gaussian;
-#endif
+
+  cutlass::Distribution::Kind initQ;
+  cutlass::Distribution::Kind initK;
+  cutlass::Distribution::Kind initV;
+  if (refCheck) {
+    initQ = cutlass::Distribution::Uniform;
+    initK = cutlass::Distribution::Uniform;
+    initV = cutlass::Distribution::Uniform;
+  } else {
+    initQ = cutlass::Distribution::Gaussian;
+    initK = cutlass::Distribution::Gaussian;
+    initV = cutlass::Distribution::Gaussian;
+  }
+
   cfk::initialize_rand(devQ.data().get(), devQ.size(), initQ, seed + 1);
   cfk::initialize_rand(devK.data().get(), devK.size(), initK, seed + 2);
   cfk::initialize_rand(devV.data().get(), devV.size(), initV, seed + 3);
@@ -610,8 +599,6 @@ void testFmhaForward(int m, int n, int k, int numHeads, int batchSize,
 
   TI alpha = TI(1.0);
   TI beta = TI(0.0);
-
-  double gflops = (2.0 * m * n * k * numHeads * batchSize) * 1e-9;
 
   const int timing_iterations = iterations;
   GPU_Clock timer;
@@ -637,15 +624,14 @@ void testFmhaForward(int m, int n, int k, int numHeads, int batchSize,
   double flash2_flops =
       4 * batchSize * numHeads * mLong * nLong * kLong / double(1.0e9);
 
-  // Run once (and check)
+  // Run few times (warmup).
   devS = hostS;
   devD = hostD;
   devV = hostV;
-  fmhaForwardDeviceLoop(m, n, k, numHeads, batchSize, alpha, devQ.data().get(),
-                        devK.data().get(), beta, devV.data().get(),
-                        devS.data().get(), devD.data().get(),
-                        devMiOut.data().get(), devSprimeOut.data().get(),
-                        warmup_iterations, nStreams);
+  fmhaForwardDeviceLoop(
+      m, n, k, numHeads, batchSize, alpha, devQ.data().get(), devK.data().get(),
+      beta, devV.data().get(), devS.data().get(), devD.data().get(),
+      devMiOut.data().get(), devSprimeOut.data().get(), 10, nStreams);
   CUTE_CHECK_LAST();
 
   // Timing iterations
@@ -670,107 +656,111 @@ void testFmhaForward(int m, int n, int k, int numHeads, int batchSize,
   thrust::host_vector<AccumType> miRefHostOut(miHostOut.size());
   thrust::host_vector<AccumType> sPrimeRefHostOut(sPrimeHostOut.size());
 
-  // bool usePreScaling = false;
-  // bool usePow2 = true;
   bool usePreScaling = true;
   bool usePow2 = false;
-#ifndef NOVERIFY
-  TestAttention<TC, AccumType> testBed(numHeads, batchSize, k, m);
-  testBed.initialize();
-  devD = hostD;
-  devS = hostS;
-  testBed.compute(devQ.data().get(), devK.data().get(), devV.data().get(),
-                  devS.data().get(), devD.data().get(), miRefHostOut.data(),
-                  sPrimeRefHostOut.data(), usePow2, usePreScaling);
-  thrust::host_vector<TC> cublas_result_S = devS;
-  thrust::host_vector<TC> cublas_result_D = devD;
+
+  if (refCheck) {
+    TestAttention<TC, AccumType> testBed(numHeads, batchSize, k, m);
+    testBed.initialize();
+    devD = hostD;
+    devS = hostS;
+    testBed.compute(devQ.data().get(), devK.data().get(), devV.data().get(),
+                    devS.data().get(), devD.data().get(), miRefHostOut.data(),
+                    sPrimeRefHostOut.data(), usePow2, usePreScaling);
+    thrust::host_vector<TC> cublas_result_S = devS;
+    thrust::host_vector<TC> cublas_result_D = devD;
 
 #ifdef COPYOUTMM0
-  // Our intermediate write to S is unscaled. So scale it before checking with
-  // CUTLASS.
-  if (usePreScaling) {
-    for (int j = 0; j < cute_result_S.size(); ++j) {
-      cute_result_S[j] = cute_result_S[j] * softmax_scale;
+    // Our intermediate write to S is unscaled. So scale it before checking with
+    // CUTLASS.
+    if (usePreScaling) {
+      for (int j = 0; j < cute_result_S.size(); ++j) {
+        cute_result_S[j] = cute_result_S[j] * softmax_scale;
+      }
     }
-  }
-  bool gemm1 = cfk::verify_tensor(cute_result_S, cublas_result_S, printValues);
-  std::string result1 = gemm1 ? "Passed" : "Failed";
-  std::cout << "gemm-check-1: " << result1 << std::endl;
+    bool gemm1 =
+        cfk::verify_tensor(cute_result_S, cublas_result_S, printValues);
+    std::string result1 = gemm1 ? "Passed" : "Failed";
+    std::cout << "gemm-check-1: " << result1 << std::endl;
 #endif
 
 #ifdef COPYOUTMI
-  // Our intermediate write to MI is scaled. So un-scale it before checking with
-  // CUTLASS.
-  if (!usePow2) {
-    for (int j = 0; j < miHostOut.size(); ++j) {
-      miHostOut[j] = miHostOut[j] * (1.0 / kLog2e);
+    // Our intermediate write to MI is scaled with log2e. So un-scale it before checking
+    // with CUTLASS.
+    if (!usePow2) {
+      for (int j = 0; j < miHostOut.size(); ++j) {
+        miHostOut[j] = miHostOut[j] * (1.0 / kLog2e);
+      }
     }
-  }
-  bool maxCheck = cfk::verify_tensor(miHostOut, miRefHostOut, printValues);
-  std::string maxCheckResult = maxCheck ? "Passed" : "Failed";
-  std::cout << "max-check: " << maxCheckResult << std::endl;
+    bool maxCheck = cfk::verify_tensor(miHostOut, miRefHostOut, printValues);
+    std::string maxCheckResult = maxCheck ? "Passed" : "Failed";
+    std::cout << "max-check: " << maxCheckResult << std::endl;
 
-  // Our intermediate write to sPrime is not reciprocal. So invert it before
-  // checking with CUTLASS.
-  for (int j = 0; j < sPrimeHostOut.size(); ++j) {
-    sPrimeHostOut[j] = (1.0 / sPrimeHostOut[j]);
-  }
-  bool sumCheck =
-      cfk::verify_tensor(sPrimeHostOut, sPrimeRefHostOut, printValues);
-  std::string sumCheckResult = sumCheck ? "Passed" : "Failed";
-  std::cout << "sum-check: " << sumCheckResult << std::endl;
+    // Our intermediate write to sPrime is not reciprocal. So invert it before
+    // checking with CUTLASS.
+    for (int j = 0; j < sPrimeHostOut.size(); ++j) {
+      sPrimeHostOut[j] = (1.0 / sPrimeHostOut[j]);
+    }
+    bool sumCheck =
+        cfk::verify_tensor(sPrimeHostOut, sPrimeRefHostOut, printValues);
+    std::string sumCheckResult = sumCheck ? "Passed" : "Failed";
+    std::cout << "sum-check: " << sumCheckResult << std::endl;
 #endif
 
-  bool gemm2 = cfk::verify_tensor(cute_result_D, cublas_result_D, printValues);
-  std::string result2 = gemm2 ? "Passed" : "Failed";
-  std::cout << "gemm-check-2: " << result2 << std::endl;
-#endif // NOVERIFY
+    bool gemm2 =
+        cfk::verify_tensor(cute_result_D, cublas_result_D, printValues);
+    std::string result2 = gemm2 ? "Passed" : "Failed";
+    std::cout << "gemm-check-2: " << result2 << std::endl;
+  }
 }
 
-int main(int argc, char **argv) {
-  int type = 1; // 1 means tf32, 2 means half
-  if (argc >= 2)
-    sscanf(argv[1], "%d", &type);
+/// Prints the usage statement.
+void print_usage() {
 
-  int m = 4096;
-  if (argc >= 3)
-    sscanf(argv[2], "%d", &m);
+  std::cout
+      << "fmha_forward"
+      << "Options:\n\n"
+      << "  --help                      If specified, displays this usage "
+         "statement.\n\n"
+      << "  --batch-size=<int>          Batch size in multi-head attention "
+         "(default: --batch_size=16).\n"
+      << "  --dim-size=<int>            Size of the head dimension. \n"
+      << "  --seq-length=<int>          Sequence length in multi-head "
+         "attention for Q (default: --seq_length=1024).\n"
+      << "  --iterations=<int>          Number of profiling iterations to "
+         "perform.\n"
+      << "  --num-cuda-streams=<int>    Number of CUDA streams to use "
+         "(default=1).\n"
+      << "  --reference-check=<bool>    If true, performs reference check.\n"
+      << "  --print-values=<bool>       If true, prints the values of the "
+         "result (also the intermediate results of gemm-I & softmax).\n";
+}
 
-  int k = 2048;
-  if (argc >= 4)
-    sscanf(argv[3], "%d", &k);
+int main(int argc, char const **argv) {
 
-  int batchSize = 1;
-  if (argc >= 5)
-    sscanf(argv[4], "%d", &batchSize);
-
-  int iterations = 10;
-  if (argc >= 6)
-    sscanf(argv[5], "%d", &iterations);
-
-  int warmup_iterations = 1;
-  if (argc >= 7)
-    sscanf(argv[6], "%d", &warmup_iterations);
-
-  bool printValues = false;
-  if (argc >= 8)
-    sscanf(argv[7], "%d", &printValues);
-
-  int nStreams = 1;
-  if (argc >= 9)
-    sscanf(argv[8], "%d", &nStreams);
-
-  int numHeads = k / kHeadSize;
-  if (type == 1) {
-    int n = m;
-    testFmhaForward<cutlass::half_t, cutlass::half_t, cutlass::half_t,
-                    cutlass::half_t>(m, n, kHeadSize, numHeads, batchSize,
-                                     warmup_iterations, iterations, printValues,
-                                     nStreams);
-  } else {
-    std::cout << "invalid type value (1 (fp16) is the only legal values)";
-    exit(-1);
+  cutlass::CommandLine cmd(argc, argv);
+  // Parses the command line
+  if (cmd.check_cmd_line_flag("help")) {
+    print_usage();
+    return;
   }
+
+  int seqLength, batchSize, dimSize, iterations, nStreams;
+  bool refCheck, printValues;
+  cmd.get_cmd_line_argument("batch-size", batchSize, 16);
+  cmd.get_cmd_line_argument("dim-size", dimSize, 2048);
+  cmd.get_cmd_line_argument("seq-length", seqLength, 1024);
+  cmd.get_cmd_line_argument("iterations", iterations, 20);
+  cmd.get_cmd_line_argument("num-cuda-streams", nStreams, 1);
+  cmd.get_cmd_line_argument("reference-check", refCheck, false);
+  cmd.get_cmd_line_argument("print-values", printValues, false);
+
+  int numHeads = dimSize / kHeadSize;
+
+  testFmhaForward<cutlass::half_t, cutlass::half_t, cutlass::half_t,
+                  cutlass::half_t>(seqLength, seqLength, kHeadSize, numHeads,
+                                   batchSize, iterations, refCheck, printValues,
+                                   nStreams);
 
   return 0;
 }
