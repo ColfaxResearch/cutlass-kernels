@@ -48,35 +48,12 @@ struct SharedStorage {
 };
 
 struct TStoTP {};
-struct MNtoTC {};
-struct MNtoTQ {};
 
 template <typename T, typename ReshapeT> struct Reshape {
 
   template <class FragmentC, class FragmentQ>
   __device__ auto operator()(FragmentC &tC, FragmentQ &tQ) {
     return make_layout(1);
-  }
-};
-
-// NOT TESTED or USED YET.
-template <> struct Reshape<cutlass::half_t, MNtoTC> {
-  template <class FragmentC, class FragmentQ>
-  __device__ auto operator()(FragmentC &tMN, FragmentQ &tC) {
-
-    static_assert(rank<0>(tC) == 3);
-    static_assert(rank<1>(tC) == 1);
-    static_assert(rank<2>(tC) == 1);
-
-    auto MT = size<1>(tC);
-    auto NT = size<2>(tC);
-    auto VT = size<0>(tC);
-    auto rowSizePerTile = 2 * size<2>(VT);
-    auto rowSize = rowSizePerTile * NT;
-
-    return make_layout(
-        tC.layout().shape(),
-        make_stride(make_stride(1, rowSize, 2), 2 * rowSize, rowSizePerTile));
   }
 };
 
@@ -145,14 +122,6 @@ fmhaForward(TA const *Q, CUTE_GRID_CONSTANT TiledCopyA const tmaLoadQ,
   auto blockIdxH = uint64_t(blockIdx.y);
   auto blockIdxB = uint64_t(blockIdx.z);
 
-  Tensor miGlobal = make_tensor(make_gmem_ptr(mi_ptr), gmemLayoutMi);
-  Tensor miGlobalOut =
-      local_tile(miGlobal, make_shape(get<0>(tileShapeQ), 1, 1),
-                 make_coord(blockIdxX, blockIdxH, blockIdxB));
-  Tensor sPrimeGlobal = make_tensor(make_gmem_ptr(sPrimePtr), gmemLayoutMi);
-  Tensor sPrimeGlobalOut =
-      local_tile(sPrimeGlobal, make_shape(get<0>(tileShapeQ), 1, 1),
-                 make_coord(blockIdxX, blockIdxH, blockIdxB));
 
   // Construct SMEM tensors.
   Tensor sQ =
@@ -316,6 +285,14 @@ fmhaForward(TA const *Q, CUTE_GRID_CONSTANT TiledCopyA const tmaLoadQ,
   }
 
 #ifdef COPYOUTMI
+  Tensor miGlobal = make_tensor(make_gmem_ptr(mi_ptr), gmemLayoutMi);
+  Tensor miGlobalOut =
+      local_tile(miGlobal, make_shape(get<0>(tileShapeQ), 1, 1),
+                 make_coord(blockIdxX, blockIdxH, blockIdxB));
+  Tensor sPrimeGlobal = make_tensor(make_gmem_ptr(sPrimePtr), gmemLayoutMi);
+  Tensor sPrimeGlobalOut =
+      local_tile(sPrimeGlobal, make_shape(get<0>(tileShapeQ), 1, 1),
+                 make_coord(blockIdxX, blockIdxH, blockIdxB));
   if (threadIdx.x % 4 == 0) {
     auto mmaThreadLayoutC = TiledMma0{}.get_layoutC_TV();
     auto mmaShapeMNK = cute::tile_shape(TiledMma0{});
