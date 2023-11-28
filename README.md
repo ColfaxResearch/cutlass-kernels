@@ -11,3 +11,7 @@ Library of CUTLASS kernels targeting Large Language Models (LLM).
 # Running
 
 1. While running the executable make sure to set NVIDIA_TF32_OVERRIDE=1 to enable TF32 mode for cuBLAS for SGEMM. Otherwise, cuBLAS uses float32.
+
+# Notes
+
+1. See README.md in sub-directories for more specific instructions.
