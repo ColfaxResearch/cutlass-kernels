@@ -16,7 +16,7 @@ public:
   //
   // Type definitions
   //
-  static constexpr float kLog2e = 1.4426950408889634074; // log_2(e) = M_LOG2E
+  static constexpr float kLog2e = float(1.4426950408889634074); // log_2(e) = M_LOG2E
   using ElementQ = Element;
   using ElementK = Element;
   using ElementS = Element;

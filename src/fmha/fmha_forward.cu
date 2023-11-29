@@ -594,7 +594,7 @@ void fmhaForwardDeviceLoop(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCHSIZE,
 template <typename PrecType, int HEADDIM>
 void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
                      bool refCheck, bool printValues, int nStreams) {
-  constexpr float kLog2e = 1.4426950408889634074; // log_2(e) = M_LOG2E
+  constexpr float kLog2e = float(1.4426950408889634074); // log_2(e) = M_LOG2E
   const float softmax_scale = (1.0f / sqrt(float(HEADDIM)));
   const float scale = softmax_scale * kLog2e;
   cudaDeviceReset();
@@ -655,7 +655,7 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
   GPU_Clock timer;
 
   double fmha_flops =
-      4 * batchSize * numHeads * mLong * nLong * kLong / double(1.0e9);
+      double (4 * batchSize * numHeads * mLong * nLong * kLong) / double(1.0e9);
 
   // Run few times (warmup).
   devS = hostS;
