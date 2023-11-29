@@ -459,12 +459,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
 
   // Layout for Vtranspose. For using in GEMM-II.
   auto tileShapeVt = make_shape(bK{}, bN{});
-  using SmemLayoutVAtomBits =
-      ComposedLayout<Swizzle<3, 4, 3>, smem_ptr_flag,
-                     Layout<Shape<_1024, Int<bN{}>>, Stride<_1, _1024>>>;
-  using SmemLayoutVAtom =
-      decltype(upcast<sizeof_bits<MmaB>::value>(SmemLayoutVAtomBits{}));
-  auto smemLayoutVt = tile_to_shape(SmemLayoutVAtom{}, tileShapeVt);
+  auto smemLayoutVt = composition(smemLayoutV, make_layout(tileShapeVt, GenRowMajor{}));
 
   auto tileShapeO = make_shape(bM{}, bK{});
   Layout gmemLayoutO =
