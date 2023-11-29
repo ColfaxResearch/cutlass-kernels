@@ -654,10 +654,6 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
   const int timing_iterations = iterations;
   GPU_Clock timer;
 
-  //
-  // CuTe
-  //
-
   double fmha_flops =
       4 * batchSize * numHeads * mLong * nLong * kLong / double(1.0e9);
 
@@ -681,7 +677,7 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
       devV.data().get(), devS.data().get(), devD.data().get(),
       devMiOut.data().get(), devSprimeOut.data().get(), iterations, nStreams,
       scale);
-  double cute_time = timer.seconds() / timing_iterations;
+  double cute_time = timer.seconds() / (float) timing_iterations;
   CUTE_CHECK_LAST();
   printf("CUTE_FMHA:     [%6.1f]Gflop/s  "
          "(%6.4f)ms\n",
