@@ -1,34 +1,12 @@
 #include <vector>
 
 #include "cutlass/cutlass.h"
-#include "cutlass/gemm/device/gemm_grouped.h"
-#include "cutlass/gemm/device/gemm_universal.h"
-#include "cutlass/gemm/gemm.h"
-#include "cutlass/gemm/kernel/default_gemm_grouped.h"
-#include "cutlass/gemm/kernel/gemm_grouped.h"
 
-#include "cutlass/util/command_line.h"
 #include "cutlass/util/device_memory.h"
-#include "cutlass/util/distribution.h"
-#include "cutlass/util/host_tensor.h"
 #include "cutlass/util/reference/device/gemm_complex.h"
-#include "cutlass/util/reference/device/tensor_fill.h"
 #include "cutlass/util/reference/host/gemm_complex.h"
-#include "cutlass/util/reference/host/tensor_compare.h"
-#include "cutlass/util/reference/host/tensor_copy.h"
-#include "cutlass/util/reference/host/tensor_norm.h"
 #include "cutlass/util/tensor_view_io.h"
 
-#include "cutlass/gemm/device/default_gemm_configuration.h"
-#include "cutlass/gemm/gemm.h"
-#include "cutlass/gemm/kernel/default_gemm.h"
-#include "cutlass/gemm/kernel/default_gemm_complex.h"
-#include "cutlass/gemm/kernel/gemm_grouped.h"
-#include "cutlass/gemm/kernel/gemm_transpose_operands.h"
-#include "cutlass/layout/matrix.h"
-
-#include "cutlass/epilogue/threadblock/epilogue_with_visitor.h"
-#include "cutlass/fast_math.h"
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -139,7 +117,7 @@ public:
   void initialize() {
 
     //
-    // Set scalors for the mha example
+    // Set scaling factor(s).
     //
 
     alpha0 = 1.0f / sqrt(float(head_size));
@@ -170,7 +148,7 @@ public:
     ldo = LayoutO::packed({problem1.m(), head_number * problem1.n()}).stride(0);
   }
 
-  /// Verifies the result is a GEMM
+  /// Verifies the result using plain GEMM + Softmax.
   void compute(const ElementQ *Q, const ElementK *K, const ElementV *V,
                ElementS *S, ElementO *O, ElementNorm *norm, ElementSum *sum,
                bool usePow2 = false, bool usePreScaling = true) {
@@ -221,7 +199,7 @@ public:
         cutlass::TensorView<ElementSum, LayoutNorm> view_Sum_Ref(
             offsetSum, layout_norm, extent_norm);
 
-        // Reference GEMM
+        // Reference GEMM-I.
 
         float alphaMma0 = usePreScaling ? alpha0 : 1.0f;
         float postScaling = usePreScaling ? 1.0f : alpha0;
@@ -323,7 +301,7 @@ public:
         cutlass::device_memory::copy_to_device(
             block_Ref_P.get(), matrix_Ref.data(), matrix_Ref.size());
 
-        // Reference GEMM
+        // Reference GEMM-II.
         cutlass::reference::device::GemmComplex<
             ElementP, LayoutP, ElementV, LayoutV, ElementO, LayoutO,
             ElementCompute, ElementAccumulator>(

@@ -1,3 +1,54 @@
+/***************************************************************************************************
+ * Copyright (c) 2017 - 2023 COLFAX
+ * TODO: Fill copyright details.
+ **************************************************************************************************/
+
+/*! \file
+    \brief FMHA Attention Example.
+
+    This workload computes a fused multi head attention.
+    Because it keeps the attention matrix in shared memory, it's both faster and
+    uses less global memory.
+
+    This is based on `"Self-Attention Does Not Need O(n^2) Memory" <http://arxiv.org/abs/2112.05682>`_,
+    and very similar to `"FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness" <https://arxiv.org/abs/2205.14135>`_.
+
+    Algorithm:
+      In short, we can compute the output incrementally in blocks of size B,
+      we just need to divide the final result by the sum of all coefficients in
+      the softmax (which we compute incrementally) with the following pseudo-code:
+
+      ```
+      s_prime = torch.zeros([num_queries, B])
+      O = torch.zeros([num_queries, head_size_v])
+      for i in range(0, K.shape[0], B):
+        si = exp((Q . K[i * B:(i+1) * B].t) * scale)
+        sum_coefs += attn_unscaled.sum(-1)
+        O  += si . V[i * B:(i+1) * B]
+      O = O / s_prime
+      ```
+
+      In practice, and for numerical stability reasons,
+      we also substract the maximum so far (`mi`) before doing
+      the exponential. When we encounter new keys, the maximum
+      used to compute O so far (`m_prime`) can differ from the
+      current maximum, so we update O before accumulating with
+
+      ```
+      O       = O * exp(m_prime - mi)
+      m_prime = mi
+      ```
+
+    Implementation details:
+      - `mi` and `si` are stored in RMEM between the 2 back to back gemms.
+      - we keep and accumulate the output directly in registers.
+      - blocks are parallelized across the batch dimension (B), the number
+      of heads (H), and the query sequence size (M).
+
+*/
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 
@@ -8,33 +59,34 @@
 
 #include "cute/arch/cluster_sm90.hpp"
 #include "cutlass/util/GPU_Clock.hpp"
-#include "cutlass/util/print_error.hpp"
-#if defined(CUTLASS_ENABLE_CUBLAS) && CUTLASS_ENABLE_CUBLAS != 0
-#include "cutlass/util/cublas_wrappers.hpp"
-#endif
-#include "cutlass/arch/reg_reconfig.h"
+#include "cutlass/util/command_line.h"
 #include "cutlass/util/helper_cuda.hpp"
+#include "cutlass/util/print_error.hpp"
+
 #include "utils/cuda_launch.hpp"
 #include "utils/fmha_cutlass.hpp"
 #include "utils/random.hpp"
 
 #include "gemm/copy_tensor.hpp"
 #include "gemm/gemm_tensor.hpp"
+
 #include "online_softmax.h"
 
-// Default 64.
+// Default kQueriesPerBlock is 64.
 #ifdef QBLKSIZE
 constexpr int kQueriesPerBlock = QBLKSIZE;
 #else
 constexpr int kQueriesPerBlock = 64;
 #endif
 
+// Default kKeysPerBlock is 64.
 #ifdef KBLKSIZE
 constexpr int kKeysPerBlock = KBLKSIZE;
 #else
 constexpr int kKeysPerBlock = 64;
 #endif
 
+// Shared Storage with Aligned addresses.
 template <class ElementType, class SmemLayoutQ, class SmemLayoutK,
           class SmemLayoutS, class SmemLayoutV>
 struct SharedStorage {
@@ -47,21 +99,13 @@ struct SharedStorage {
   cute::uint64_t tma_load_mbar[2];
 };
 
-struct TStoTP {};
-
-template <typename T, typename ReshapeT> struct Reshape {
-
-  template <class FragmentC, class FragmentQ>
-  __device__ auto operator()(FragmentC &tC, FragmentQ &tQ) {
-    return make_layout(1);
-  }
-};
-
-template <> struct Reshape<cutlass::half_t, TStoTP> {
+// Reshape Utility for converting the layout from accumulator of GEMM-I
+// to Operanad A of GEMM-II.
+struct ReshapeTStoTP {
   template <class FragmentC, class FragmentQ>
   __device__ auto operator()(FragmentC &tC, FragmentQ &tQ) {
 
-    // get the layout of one row of Q
+    // get the layout of one row of Q.
     auto layoutQRow = make_ordered_layout(tQ(_, 0, _).layout());
     // get the layout of  M dimension of C.
     auto layoutCM = get<1>(tC.layout());
@@ -69,59 +113,61 @@ template <> struct Reshape<cutlass::half_t, TStoTP> {
   }
 };
 
+// Converstion Utility to convert RMEM from one type to another.
+// Used for conversion from AccumType to PrecType.
 template <typename To_type, typename From_type, typename Fragment>
 inline __device__ auto convert_type(Fragment const &tensor) {
   constexpr int numel = decltype(size(tensor))::value;
   cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
-  // HACK: this requires tensor to be "contiguous"
+  // Note: this requires tensor to be "contiguous."
   auto frag =
       convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(
           tensor.data()));
   return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
 }
 
-template <class TiledMma0, class TiledMma1, class ClusterShape, class TA,
-          class TiledCopyA, class TileShapeA, class GmemLayoutA,
-          class SmemLayoutQ, class TB, class TiledCopyB, class TileShapeB,
-          class GmemLayoutB, class SmemLayoutK, class TC, class TileShapeQ,
-          class GmemLayoutQ, class SmemLayoutS, class TiledCopyV,
+// Main FMHA Device Kernel.
+// PrecType = Precision of Computation used by GEMM (half_t by default).
+// AccumType = Type of Accumulator used by GEMM (float by default).
+// Other types are self-explanatory.
+template <class PrecType, class AccumType, class TiledMma0, class TiledMma1,
+          class TiledCopyQ, class TileShapeQ, class GmemLayoutQ,
+          class SmemLayoutQ, class TiledCopyK, class TileShapeK,
+          class GmemLayoutK, class SmemLayoutK, class TileShapeS,
+          class GmemLayoutS, class SmemLayoutS, class TiledCopyV,
           class TileShapeV, class GmemLayoutV, class SmemLayoutV,
-          class SmemLayoutVt, class TileShapeD, class GmemLayoutD,
-          class GmemLayoutMI,
-          class AccumType>
+          class SmemLayoutVt, class TileShapeD, class GmemLayoutO,
+          class GmemLayoutMI>
 __global__ static void //__launch_bounds__(128, 2)
-fmhaForward(TA const *Q, CUTE_GRID_CONSTANT TiledCopyA const tmaLoadQ,
-            TileShapeA tileShapeQ, GmemLayoutA gmemLayoutQ,
-            SmemLayoutQ smemLayoutQ, TB const *K,
-            CUTE_GRID_CONSTANT TiledCopyB const tmaLoadK, TileShapeB tileShapeK,
-            GmemLayoutB gmemLayoutK, SmemLayoutK smemLayoutK, TC *S,
-            TileShapeQ tileShapeS, GmemLayoutQ gmemLayoutS,
-            SmemLayoutS smemLayoutS, int nTilesOfK, TB *V,
+fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
+            TileShapeQ tileShapeQ, GmemLayoutQ gmemLayoutQ,
+            SmemLayoutQ smemLayoutQ, PrecType const *K,
+            CUTE_GRID_CONSTANT TiledCopyK const tmaLoadK, TileShapeK tileShapeK,
+            GmemLayoutK gmemLayoutK, SmemLayoutK smemLayoutK, PrecType *S,
+            TileShapeS tileShapeS, GmemLayoutS gmemLayoutS,
+            SmemLayoutS smemLayoutS, int nTilesOfK, PrecType *V,
             CUTE_GRID_CONSTANT TiledCopyV const tmaLoadV, TileShapeV tileShapeV,
             GmemLayoutV gmemLayoutV, SmemLayoutV smemLayoutV,
-            SmemLayoutVt smemLayoutVt, TC *O, TileShapeD tileShapeO,
-            GmemLayoutD gmemLayoutO, AccumType *mi_ptr, AccumType *sPrimePtr,
+            SmemLayoutVt smemLayoutVt, PrecType *O, TileShapeD tileShapeO,
+            GmemLayoutO gmemLayoutO, AccumType *mi_ptr, AccumType *sPrimePtr,
             GmemLayoutMI gmemLayoutMi, float scale) {
 
   using namespace cute;
-  CUTE_STATIC_ASSERT_V(product_each(shape(tileShapeQ)) ==
-                       product_each(shape(smemLayoutQ)));
 
-  // Use Shared Storage structure to allocate and distribute aligned SMEM
-  // addresses
+  // Use Shared Storage structure to allocate aligned SMEM addresses.
   extern __shared__ char shared_memory[];
-  using SharedStorage =
-      SharedStorage<TA, SmemLayoutQ, SmemLayoutK, SmemLayoutS, SmemLayoutV>;
+  using SharedStorage = SharedStorage<PrecType, SmemLayoutQ, SmemLayoutK,
+                                      SmemLayoutS, SmemLayoutV>;
   SharedStorage &shared_storage =
       *reinterpret_cast<SharedStorage *>(shared_memory);
 
   // Shared memory barriers use 64bits in SMEM for synchronization
   uint64_t *tma_load_mbar = shared_storage.tma_load_mbar;
 
+  // Get the block co-ordinates for this CTA.
   auto blockIdxX = uint64_t(blockIdx.x);
   auto blockIdxH = uint64_t(blockIdx.y);
   auto blockIdxB = uint64_t(blockIdx.z);
-
 
   // Construct SMEM tensors.
   Tensor sQ =
@@ -138,43 +184,48 @@ fmhaForward(TA const *Q, CUTE_GRID_CONSTANT TiledCopyA const tmaLoadQ,
 #endif
   Tensor sV =
       make_tensor(make_smem_ptr(shared_storage.smem_v.data()), smemLayoutV);
+
+  // Tensor for V Transpose; used in GEMM-II.
   Tensor sVt =
       make_tensor(make_smem_ptr(shared_storage.smem_v.data()), smemLayoutVt);
 
+  // Get the full un-partitioned tensors.
+  // TMA tensors are sepcial tensors.
   Tensor mQ = tmaLoadQ.get_tma_tensor(shape(gmemLayoutQ));
   Tensor mK = tmaLoadK.get_tma_tensor(shape(gmemLayoutK));
   Tensor mV = tmaLoadV.get_tma_tensor(shape(gmemLayoutV));
-  Tensor mS = make_tensor(make_gmem_ptr(S), gmemLayoutS);
   Tensor mO = make_tensor(make_gmem_ptr(O), gmemLayoutO);
-  auto blkCoordQ = make_coord(blockIdxX, 0, blockIdxH, blockIdxB);
-
-  Tensor gQ = local_tile(mQ, tileShapeQ, blkCoordQ);
-  //
-  // Prepare the TMA_LOAD for A
-  //
-
-  auto cta_tmaQ = tmaLoadQ.get_slice(0); // CTA slice
-  auto cta_tmak = tmaLoadK.get_slice(0); // CTA slice
-  auto cta_tmaV = tmaLoadV.get_slice(0); // CTA slice
-
-  Tensor tQgQX = cta_tmaQ.partition_S(gQ);
 
   TiledMma0 tiledMma0;
   auto threadMma0 = tiledMma0.get_thread_slice(threadIdx.x);
   TiledMma1 tiledMma1;
   auto threadMma1 = tiledMma1.get_thread_slice(threadIdx.x);
-  //
-  // Perform the TMA_LOAD
-  //
 
-  // INPUT: Group the REST_X modes and the TMA_X modes to easily iterate through
-  // the tiles
+  //
+  // Prepare the TMA_LOADS. Currently, our cluster size is one.
+  // So, use only the 0th slice.
+  //
+  auto cta_tmaQ = tmaLoadQ.get_slice(0);
+  auto cta_tmak = tmaLoadK.get_slice(0);
+  auto cta_tmaV = tmaLoadV.get_slice(0);
+
+  // Get the block of Q for this CTA using the block co-ordinates.
+  auto blkCoordQ = make_coord(blockIdxX, 0, blockIdxH, blockIdxB);
+  Tensor gQ = local_tile(mQ, tileShapeQ, blkCoordQ);
+
+  // Partition the copying of source tiles for Q among threads.
+  Tensor tQgQX = cta_tmaQ.partition_S(gQ);
+  // Group the REST_X modes and the TMA_X modes to easily iterate through the
+  // tiles
   Tensor tQgQ = group_modes<1, rank(tQgQX)>(tQgQX); // (TMA,REST)
   auto kTiles = size<1>(tQgQ);
   assert(kTiles == 1);
   assert(kTiles == size<2>(gQ));
 
-  Tensor tQsQX = cta_tmaQ.partition_D(sQ);          // (TMA,TMA_M,TMA_N)
+  //
+  // Partition the copying of dest tiles for Q, K and V among threads.
+  //
+  Tensor tQsQX = cta_tmaQ.partition_D(sQ);
   Tensor tQsQ = group_modes<1, rank(tQsQX)>(tQsQX); // (TMA,REST)
   Tensor tKsKX = cta_tmak.partition_D(sK);
   Tensor tKsK = group_modes<1, rank(tKsKX)>(tKsKX);
@@ -185,50 +236,52 @@ fmhaForward(TA const *Q, CUTE_GRID_CONSTANT TiledCopyA const tmaLoadQ,
 
   // Allocate "fragments/descriptors"
   // for first matmul.
-  Tensor tSsQ = threadMma0.partition_A(sQ);
-  Tensor tSsK = threadMma0.partition_B(sK);
-  Tensor tSrQ = threadMma0.make_fragment_A(tSsQ);
-  Tensor tSrK = threadMma0.make_fragment_B(tSsK);
+  Tensor tSrQ = threadMma0.partition_fragment_A(sQ);
+  Tensor tSrK = threadMma0.partition_fragment_B(sK);
   Tensor tSrS = partition_fragment_C(tiledMma0, tileShapeS);
   clear(tSrS);
-#ifdef SINSMEM
-  Tensor tSsS = threadMma0.partition_C(sS);
-  __syncthreads();
-  cute::fill(tSsS, TC(0.0));
-  __syncthreads();
-#endif
 
-  // For second mamtul, S becomes P.
-  Tensor tOsP = threadMma1.partition_A(sS);
+  // Allocate "fragments/descriptors"
+  // for second matmul.
+  // Note: S becomes P.
   Tensor tOrV = threadMma1.partition_fragment_B(sVt);
   Tensor tOrO = partition_fragment_C(tiledMma1, tileShapeO);
   clear(tOrO);
 
+// Use this flag to store result of GEMM-I to SMEM. GEMM-II
+// will also read from SMEM. By default, this flag is disabled.
 #ifdef SINSMEM
-  Tensor tOrP = threadMma1.make_fragment_A(tOsP);
+  Tensor tSsS = threadMma0.partition_C(sS);
+  cute::fill(tSsS, PrecType(0.0));
+  Tensor tOrP = threadMma1.partition_fragment_A(sS);
 #else
-  Tensor tOrS = threadMma1.make_fragment_A(tOsP);
-  auto tOrPLayout = Reshape<TC, TStoTP>()(tSrS, tOrS);
-  auto tOrP = make_tensor(reinterpret_cast<TA *>(tSrS.data()), tOrPLayout);
+  Tensor tOrS = threadMma1.partition_fragment_A(sS);
+  auto tOrPLayout = ReshapeTStoTP()(tSrS, tOrS);
+  auto tOrP = make_tensor(tSrS.data(), tOrPLayout);
 #endif
 
+  // Allocate space for per-thread rowMax and rowSum in rmem.
   Tensor rowMax = make_tensor<AccumType>(Shape<Int<2 * size<1>(tSrS)>>{});
   Tensor rowSum = make_fragment_like(rowMax);
   cute::fill(rowMax, -cutlass::platform::numeric_limits<AccumType>::infinity());
   cute::fill(rowSum, AccumType(0.0));
 
+  // Copy Q tile from GMEM to SMEM.
   cfk::copy(tQgQ(_, 0), tQsQ(_, 0), tmaLoadQ, tma_load_mbar[0]);
 
   auto blkCoordK = make_coord(0, 0, blockIdxH, blockIdxB);
 
   Tensor gK = local_tile(mK, tileShapeK, blkCoordK);
 
-  Tensor tKgKX = cta_tmak.partition_S(gK); // (TMA,TMA_M,TMA_N,REST_M,REST_N)
+  Tensor tKgKX = cta_tmak.partition_S(gK);
   Tensor tKgK = group_modes<1, rank(tKgKX)>(tKgKX); // (TMA,REST)
   assert(size<1>(tKgK) == size<2>(gK));
   assert(size<1>(tKgK) == kTiles);
   static_assert(size<1>(tKsK) == 1);
+
+  // Copy first tile of K from GMEM to SMEM.
   cfk::copy_nobar(tKgK(_, 0), tKsK(_, 0), tmaLoadK, tma_load_mbar[0]);
+
 #pragma unroll
   for (uint64_t blockIdxY = 0; blockIdxY < nTilesOfK; ++blockIdxY) {
 
@@ -241,17 +294,23 @@ fmhaForward(TA const *Q, CUTE_GRID_CONSTANT TiledCopyA const tmaLoadQ,
     assert(size<1>(tVgV) == size<2>(gV));
     assert(size<1>(tVgV) == 1);
 
+    // Copy current tile of V from GMEM to SMEM.
     cfk::copy_nobar(tVgV(_, 0), tVsV(_, 0), tmaLoadV, tma_load_mbar[1]);
     clear(tSrS);
+
+    // Issue GEMM-I.
     cfk::gemm_bar_wait(tiledMma0, tSrQ, tSrK, tSrS, tma_load_mbar[0]);
 
+// Required for verification ONLY.
 #ifdef COPYOUTMM0
+    Tensor mS = make_tensor(make_gmem_ptr(S), gmemLayoutS);
     auto blkCoordS = make_coord(blockIdxX, blockIdxY, blockIdxH, blockIdxB);
     Tensor gS = local_tile(mS, tileShapeS, blkCoordS);
     Tensor tSgS = threadMma0.partition_C(gS);
     copy(tSrS, tSgS);
 #endif
 
+    // Copy next tile of K from GMEM to SMEM.
     if (blockIdxY != (nTilesOfK - 1)) {
       auto blkCoordK = make_coord(blockIdxY + 1, 0, blockIdxH, blockIdxB);
 
@@ -262,28 +321,42 @@ fmhaForward(TA const *Q, CUTE_GRID_CONSTANT TiledCopyA const tmaLoadQ,
       cfk::copy_nobar(tKgK(_, 0), tKsK(_, 0), tmaLoadK, tma_load_mbar[0]);
     }
 
-#ifndef NOSMAX
-    if (blockIdxY == 0) {
+    if (blockIdxY == 0) { // Compute Online Softmax and NO Output Rescaling.
       onlineSoftmaxAndRescale<true, AccumType>(rowMax, rowSum, tSrS, tOrO,
                                                scale);
-    } else {
+    } else { // Compute Online Softmax and Output Rescaling.
       onlineSoftmaxAndRescale<false, AccumType>(rowMax, rowSum, tSrS, tOrO,
                                                 scale);
     }
     warpgroup_fence_operand(tSrS);
-#endif
 
-#ifndef NOGEMM
 #ifdef SINSMEM
+    // ISSUE GEMM-II with Operand A from SMEM.
+    // Copy OperandA from RMEM to SMEM before issuing.
     cfk::copy(tSrS, tSsS);
     cfk::gemm_bar_wait(tiledMma1, tOrP, tOrV, tOrO, tma_load_mbar[1]);
 #else
-    cfk::gemm_bar_wait(tiledMma1, convert_type<TA, AccumType>(tOrP), tOrV, tOrO,
-                       tma_load_mbar[1]);
-#endif
+    // ISSUE GEMM-II with Operand A from RMEM.
+    // Convert Opreand A From AccumType [=float] to PrecType [=half_t] before
+    // issuing.
+    cfk::gemm_bar_wait(tiledMma1, convert_type<PrecType, AccumType>(tOrP), tOrV,
+                       tOrO, tma_load_mbar[1]);
 #endif
   }
 
+  // Copy output Tile from RMEM to GMEM directly.
+  auto blkCoordO = make_coord(blockIdxX, 0, blockIdxH, blockIdxB);
+  Tensor gO = local_tile(mO, tileShapeO, blkCoordO);
+  Tensor tOgO = threadMma1.partition_C(gO);
+
+  // Apply softmax normalization before writing out to GMEM.
+  applySoftmaxNormalizer<AccumType>(rowSum, tOrO);
+
+  // Write out to GMEM.
+  copy(tOrO, tOgO);
+
+// Write out rowMax and rowSum to GMEM.
+// Required for verification ONLY.
 #ifdef COPYOUTMI
   Tensor miGlobal = make_tensor(make_gmem_ptr(mi_ptr), gmemLayoutMi);
   Tensor miGlobalOut =
@@ -310,18 +383,12 @@ fmhaForward(TA const *Q, CUTE_GRID_CONSTANT TiledCopyA const tmaLoadQ,
     }
   }
 #endif
-  auto blkCoordO = make_coord(blockIdxX, 0, blockIdxH, blockIdxB);
-  Tensor gO = local_tile(mO, tileShapeO, blkCoordO);
-  Tensor tOgO = threadMma1.partition_C(gO);
-#ifndef NOSMAX
-  applySoftmaxNormalizer<AccumType>(rowSum, tOrO);
-#endif
-
-  copy(tOrO, tOgO);
 
   __syncthreads();
 }
 
+// Host method that prepares the data structures
+// required before calling the DEVICE kernel.
 template <typename PrecType, typename AccumType, int HEADDIM>
 void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
                        PrecType const *tensorQ, PrecType const *tensorK,
@@ -337,18 +404,21 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   auto N = int(KEYLEN);
   auto K = int(HEADDIM);
 
-  using ClusterShape = Shape<_1, _1, _1>;
   // Define TileShapes
   using bM = Int<kQueriesPerBlock>;
   using bN = Int<kKeysPerBlock>;
   using bK = Int<HEADDIM>;
 
-  using MmaA = cute::conditional_t<cute::is_same_v<PrecType, float>, tfloat32_t,
-                                   PrecType>;
-  using MmaB = MmaA;
+  // Use half_t for computing. float for accumulator.
+  using MmaA = PrecType;
+  using MmaB = PrecType;
   using MmaC = AccumType;
 
-  // k-major for Q.
+  //
+  // All the tensors are stored in BMHK order, with K being the unit-1
+  // dimension. For now, n=m.
+  //
+
   auto ptrQ = reinterpret_cast<MmaA const *>(tensorQ);
   auto ptrK = reinterpret_cast<MmaB const *>(tensorK);
   auto ptrV = reinterpret_cast<MmaB const *>(tensorV);
@@ -361,7 +431,6 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   auto tmaQ =
       make_tma_copy(SM90_TMA_LOAD{}, gQ, smemLayoutQ, tileShapeQ, Int<1>{});
 
-  // k-major for K.
   auto tileShapeK = make_shape(bN{}, bK{});
   auto smemLayoutK =
       tile_to_shape(GMMA::Layout_K_SW128_Atom<MmaB>{}, tileShapeK);
@@ -371,16 +440,13 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   auto tmak =
       make_tma_copy(SM90_TMA_LOAD{}, gK, smemLayoutK, tileShapeK, Int<1>{});
 
-  // k-major for S, where K = N.
-  auto tileShapeS = make_shape(bM{}, bN{});
   // Use only durign debugging, direct writes to GMEM.
+  auto tileShapeS = make_shape(bM{}, bN{});
   Layout gmemLayoutS =
       make_layout(make_shape(M, N, H, B), make_stride(N, 1, N * M, H * M * N));
   // Used only for Second matmul with Q and V.
   auto smemLayoutS =
       tile_to_shape(GMMA::Layout_K_SW128_Atom<MmaA>{}, tileShapeS);
-
-  // k-major for V. Layout for GEMM-II.
 
   auto tileShapeV = make_shape(bN{}, bK{});
   auto smemLayoutV =
@@ -391,7 +457,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   auto tmaV =
       make_tma_copy(SM90_TMA_LOAD{}, gV, smemLayoutV, tileShapeV, Int<1>{});
 
-  // Layout for Vtranspose. For using in GMMA.
+  // Layout for Vtranspose. For using in GEMM-II.
   auto tileShapeVt = make_shape(bK{}, bN{});
   using SmemLayoutVAtomBits =
       ComposedLayout<Swizzle<3, 4, 3>, smem_ptr_flag,
@@ -400,62 +466,82 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
       decltype(upcast<sizeof_bits<MmaB>::value>(SmemLayoutVAtomBits{}));
   auto smemLayoutVt = tile_to_shape(SmemLayoutVAtom{}, tileShapeVt);
 
-  // k-major for D.
   auto tileShapeO = make_shape(bM{}, bK{});
   Layout gmemLayoutO =
       make_layout(make_shape(M, K, H, B), make_stride(K * H, 1, K, H * M * K));
 
-  int smem_size = int(
-      sizeof(SharedStorage<MmaA, decltype(smemLayoutQ), decltype(smemLayoutK),
-                           decltype(smemLayoutS), decltype(smemLayoutV)>));
-
+// Enable this flag for 256 threads (or 8 warps) per CTA.
+// Disabled by default.
 #ifdef CTA256
   using MmaTileShape = Layout<Shape<_2, _1, _1>>;
 #else
   using MmaTileShape = Layout<Shape<_1, _1, _1>>;
 #endif
 
+  // USE SS version of GMMA for GEMM-I.
+  // NOTE: RS version has a synchronization bug and hence not used.
   using TiledMma0 = decltype(cute::make_tiled_mma(
       cute::GMMA::ss_op_selector<MmaA, MmaB, MmaC, Shape<bM, bN, bK>>(),
       MmaTileShape{}));
 
-  // For fp32 types, map to tf32 MMA value type
 #ifdef SINSMEM
+  // USE SS version of GMMA for GEMM-II.
   using TiledMma1 = decltype(cute::make_tiled_mma(
       cute::GMMA::ss_op_selector<MmaA, MmaB, MmaC, Shape<bM, bK, bN>,
                                  GMMA::Major::K, GMMA::Major::MN>(),
       MmaTileShape{}));
 #else
+  // USE RS version of GMMA for GEMM-II (Default).
   using TiledMma1 = decltype(cute::make_tiled_mma(
       cute::GMMA::rs_op_selector<MmaA, MmaB, MmaC, Shape<bM, bK, bN>,
                                  GMMA::Major::K, GMMA::Major::MN>(),
       MmaTileShape{}));
 #endif
 
-  // col-major for MI and S_prime (only for debugging).
+  // col-major for MI and S_prime (used only for verification).
   Layout gmemLayoutMi = make_layout(make_shape(M, H, B), GenColMajor{});
 
+  // Get the ptr to kernel function.
   void const *kernel = (void const *)fmhaForward<
-      TiledMma0, TiledMma1, ClusterShape, MmaA, decltype(tmaQ),
-      decltype(tileShapeQ), decltype(gmemLayoutQ), decltype(smemLayoutQ), MmaB,
+      PrecType, AccumType, TiledMma0, TiledMma1, decltype(tmaQ),
+      decltype(tileShapeQ), decltype(gmemLayoutQ), decltype(smemLayoutQ),
       decltype(tmak), decltype(tileShapeK), decltype(gmemLayoutK),
-      decltype(smemLayoutK), PrecType, decltype(tileShapeS),
-      decltype(gmemLayoutS), decltype(smemLayoutS), decltype(tmaV),
-      decltype(tileShapeV), decltype(gmemLayoutV), decltype(smemLayoutV),
-      decltype(smemLayoutVt), decltype(tileShapeO), decltype(gmemLayoutO),
-      decltype(gmemLayoutMi), AccumType>;
+      decltype(smemLayoutK), decltype(tileShapeS), decltype(gmemLayoutS),
+      decltype(smemLayoutS), decltype(tmaV), decltype(tileShapeV),
+      decltype(gmemLayoutV), decltype(smemLayoutV), decltype(smemLayoutVt),
+      decltype(tileShapeO), decltype(gmemLayoutO), decltype(gmemLayoutMi)>;
+
+  // Compuate and set dynamic shared memory size.
+  auto smem_size = int(
+      sizeof(SharedStorage<MmaA, decltype(smemLayoutQ), decltype(smemLayoutK),
+                           decltype(smemLayoutS), decltype(smemLayoutV)>));
   cfk::utils::set_smem_size(smem_size, kernel);
 
+  //
+  // Define CUDA launch kernel parameters.
+  //
+
+  // Set the THREAD BLOCK (CTA) dimensions.
+  // #threads in CTA = #threads in MMA (128 by default).
   dim3 block_dims(size(TiledMma0{}));
+
+  // Set the GRID dimensions (3-D).
+  // First dimension = # of blocks of Q.
+  // Second dimension = # of heads.
+  // Third dimension = # of batches.
   dim3 grid_dims(ceil_div(size(M), size(bM{})), H, B);
-  dim3 cluster_dims(cute::size<0>(ClusterShape{}),
-                    cute::size<1>(ClusterShape{}),
-                    cute::size<2>(ClusterShape{}));
+
+  // We do not use cluster feature yet. So, set it to 1.
+  dim3 cluster_dims(1, 1, 1);
+
+  // Define the cluster launch parameter structure.
   cutlass::ClusterLaunchParams params{grid_dims, block_dims, cluster_dims,
                                       smem_size, stream};
 
+  // Compute the no. of tiles of K matrix.
   auto nTilesOfK = ceil_div(size(N), size(bN{}));
 
+  // Run the CUDA kernel for preferred number of iteations.
   for (int i = 0; i < iterations; ++i) {
     cutlass::Status status = cutlass::launch_kernel_on_cluster(
         params, kernel, ptrQ, tmaQ, tileShapeQ, gmemLayoutQ, smemLayoutQ, ptrK,
@@ -466,6 +552,8 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   }
 }
 
+// Wrapper function for mulitple-streams.
+// Currenlty, only single stream is used by default.
 template <typename PrecType, typename AccumType, int HEADDIM>
 void fmhaForwardDeviceLoop(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCHSIZE,
                            PrecType const *A, PrecType const *B, PrecType *V,
@@ -484,12 +572,12 @@ void fmhaForwardDeviceLoop(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCHSIZE,
       cudaStream_t stream;
       cudaStreamCreate(&stream);
 
-      auto offsetA = i * SEQLEN * HEADDIM * L;
-      auto offsetB = i * KEYLEN * HEADDIM * L;
-      auto offsetQ = i * SEQLEN * KEYLEN * L;
-      auto offsetV = i * KEYLEN * HEADDIM * L;
-      auto offsetD = i * SEQLEN * HEADDIM * L;
-      auto miOffset = i * SEQLEN * L;
+      auto offsetA = i * SEQLEN * NUMHEADS * HEADDIM * L;
+      auto offsetB = i * KEYLEN * NUMHEADS * HEADDIM * L;
+      auto offsetQ = i * SEQLEN * NUMHEADS * KEYLEN * L;
+      auto offsetV = i * KEYLEN * NUMHEADS * HEADDIM * L;
+      auto offsetD = i * SEQLEN * NUMHEADS * HEADDIM * L;
+      auto miOffset = i * SEQLEN * NUMHEADS * L;
 
       fmhaForwardDevice<PrecType, AccumType, HEADDIM>(
           SEQLEN, KEYLEN, NUMHEADS, L, A + offsetA, B + offsetB, V + offsetV,
@@ -503,6 +591,7 @@ void fmhaForwardDeviceLoop(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCHSIZE,
 #include <cstdio>
 #include <cstdlib>
 
+//  The main driver function.
 template <typename PrecType, int HEADDIM>
 void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
                      bool refCheck, bool printValues, int nStreams) {
@@ -609,7 +698,7 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
       scale);
   double cute_time = timer.seconds() / timing_iterations;
   CUTE_CHECK_LAST();
-  printf("CUTE_GEMM:     [%6.1f]GFlop/s(CUTLASS) [%6.1f]Gflop/s(FLASH2)  "
+  printf("CUTE_FMHA:     [%6.1f]GFlop/s(CUTLASS) [%6.1f]Gflop/s(FLASH2)  "
          "(%6.4f)ms\n",
          cutlass_flops / cute_time, flash2_flops / cute_time, cute_time * 1000);
 
@@ -723,8 +812,14 @@ int main(int argc, char const **argv) {
   cmd.get_cmd_line_argument("reference-check", refCheck, false);
   cmd.get_cmd_line_argument("print-values", printValues, false);
 
+  if (nStreams > batchSize) {
+    std::cout << "#max no. of cuda streams <= batchSize" << std::endl;
+    exit(-1);
+  }
   int numHeads = dimSize / kHeadSize;
 
+  // Instantiate the function template for different HEADDIMS.
+  // For now, only half_t is supported. TF32 is WIP.
   if (kHeadSize == 64) {
     testFmhaForward<cutlass::half_t, 64>(seqLength, seqLength, numHeads,
                                          batchSize, iterations, refCheck,

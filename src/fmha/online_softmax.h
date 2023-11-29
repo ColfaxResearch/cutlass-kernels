@@ -13,13 +13,6 @@
 #include "cutlass/tensor_ref.h"
 #include <cute/tensor.hpp>
 
-static CUTLASS_DEVICE float atomicMaxFloat(float *addr, float value) {
-  // source: https://stackoverflow.com/a/51549250
-  return (value >= 0)
-             ? __int_as_float(atomicMax((int *)addr, __float_as_int(value)))
-             : __uint_as_float(
-                   atomicMin((unsigned int *)addr, __float_as_uint(value)));
-}
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename T> struct MaxOp {
@@ -71,12 +64,12 @@ CUTLASS_DEVICE static void applySoftmaxNormalizer(const Fragment0 &sPrime,
   auto data = accum.data();
   int n = 0;
   int rowId = 0;
-  //#pragma unroll
+#pragma unroll
   for (int i = 0; i < size(shape<1>(accum)); ++i) {
     auto sPrime0 = AccumType(1.0 / sPrime(rowId));
     auto sPrime1 = AccumType(1.0 / sPrime(rowId + 1));
 
-    //#pragma unroll
+#pragma unroll
     for (int k = 0; k < size(shape<2>(accum)) * size<2>(shape<0>(accum)); ++k) {
       data[n] = FragValType(AccumType(data[n]) * sPrime0);
       n++;
@@ -118,11 +111,14 @@ onlineSoftmaxAndRescale(Fragment0 &mi, Fragment1 &sPrime, Fragment2 &accum,
   cute::copy(mi, miPrev);
 
   int rowId = 0;
-  //#pragma unroll
+#pragma unroll
   for (int i = 0; i < MT; ++i) {
     auto max0 = mi(rowId);
     auto max1 = mi(rowId + 1);
-    //#pragma unroll
+
+    // Traverse 2-rows + 2-cols (2x2) simultaneously.
+
+#pragma unroll
     for (int k = 0; k < NT * size<2>(VT); ++k) {
       data[n] = FragValType(AccumType(data[n]) * scaleFactor);
       max0 = cutlass::fast_max(max0, AccumType(data[n]));
@@ -173,13 +169,13 @@ onlineSoftmaxAndRescale(Fragment0 &mi, Fragment1 &sPrime, Fragment2 &accum,
   SumOp<AccumType> sumOp;
   rowId = 0;
   n = 0;
-  //#pragma unroll
+#pragma unroll
   for (int i = 0; i < MT; ++i) {
     AccumType sum0 = 0.0f;
     AccumType sum1 = 0.0f;
     auto miRow0 = mi(rowId);
     auto miRow1 = mi(rowId + 1);
-    //#pragma unroll
+#pragma unroll
     for (int k = 0; k < NT * size<2>(VT); ++k) {
 
       auto val0 = AccumType(data[n]);

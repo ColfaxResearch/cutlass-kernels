@@ -5,8 +5,9 @@ An implementation of Flash Multi Head Attention (FMHA) algorithm using CUTLASS/C
 # Building and Running.
 
 1. Download CUTLASS following instructions from: https://github.com/NVIDIA/cutlass.
-2. Modify the (hardcoded) path in the sample compile.sh to your CUTLASS directory.
-3. To run "fmha_forward", run "fmha_forward --help" first to get list of command line arguments to be supplied for the executable.
+2. To build fmha kernel, use the sample compile.sh script.
+3. Modify the hardcoded path in the sample compile.sh to your CUTLASS directory.
+4. To run "fmha_forward", run "fmha_forward --help" first to get list of command line arguments to be supplied for the executable.
 
 # Building and Running for custom tile shapes.
 
