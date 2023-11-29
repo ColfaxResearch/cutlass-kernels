@@ -10,13 +10,16 @@
     Because it keeps the attention matrix in shared memory, it's both faster and
     uses less global memory.
 
-    This is based on `"Self-Attention Does Not Need O(n^2) Memory" <http://arxiv.org/abs/2112.05682>`_,
-    and very similar to `"FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness" <https://arxiv.org/abs/2205.14135>`_.
+    This is based on `"Self-Attention Does Not Need O(n^2) Memory"
+   <http://arxiv.org/abs/2112.05682>`_, and very similar to `"FlashAttention:
+   Fast and Memory-Efficient Exact Attention with IO-Awareness"
+   <https://arxiv.org/abs/2205.14135>`_.
 
     Algorithm:
       In short, we can compute the output incrementally in blocks of size B,
       we just need to divide the final result by the sum of all coefficients in
-      the softmax (which we compute incrementally) with the following pseudo-code:
+      the softmax (which we compute incrementally) with the following
+   pseudo-code:
 
       ```
       s_prime = torch.zeros([num_queries, B])
@@ -459,7 +462,8 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
 
   // Layout for Vtranspose. For using in GEMM-II.
   auto tileShapeVt = make_shape(bK{}, bN{});
-  auto smemLayoutVt = composition(smemLayoutV, make_layout(tileShapeVt, GenRowMajor{}));
+  auto smemLayoutVt =
+      composition(smemLayoutV, make_layout(tileShapeVt, GenRowMajor{}));
 
   auto tileShapeO = make_shape(bM{}, bK{});
   Layout gmemLayoutO =
@@ -654,21 +658,7 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
   // CuTe
   //
 
-  double cutlass_flops = 0.0;
-  // P <- Q . K_t
-  cutlass_flops += 2 * mLong * nLong * kLong;
-  // P <- exp(P - max(P))
-  cutlass_flops += 2 * mLong * nLong;
-  // S <- sum(P)
-  cutlass_flops += mLong * (nLong - 1);
-  // O <- P . V
-  cutlass_flops += 2 * mLong * nLong * kLong;
-  // O <- O / S
-  cutlass_flops += mLong * nLong * kLong;
-
-  cutlass_flops *= numHeads * batchSize / double(1.0e9);
-
-  double flash2_flops =
+  double fmha_flops =
       4 * batchSize * numHeads * mLong * nLong * kLong / double(1.0e9);
 
   // Run few times (warmup).
@@ -693,9 +683,9 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
       scale);
   double cute_time = timer.seconds() / timing_iterations;
   CUTE_CHECK_LAST();
-  printf("CUTE_FMHA:     [%6.1f]GFlop/s(CUTLASS) [%6.1f]Gflop/s(FLASH2)  "
+  printf("CUTE_FMHA:     [%6.1f]Gflop/s  "
          "(%6.4f)ms\n",
-         cutlass_flops / cute_time, flash2_flops / cute_time, cute_time * 1000);
+         fmha_flops / cute_time, cute_time * 1000);
 
   thrust::host_vector<PrecType> cute_result_S = devS;
   thrust::host_vector<PrecType> cute_result_D = devD;
