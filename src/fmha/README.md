@@ -17,3 +17,7 @@ An implementation of Flash Multi Head Attention (FMHA) algorithm using CUTLASS/C
 QBLK is the QUERY_BLOCK_SIZE and KBLK is the KEY_BLOCK_SIZE.
 
 3. To run for different Tiling configurations, the script shall be modified to use different shapes for QBLK and KBLK.
+
+# NOTES:
+
+1. Tested with CUDA 12.2 and CUTLASS 3.3 and SM90A. 
