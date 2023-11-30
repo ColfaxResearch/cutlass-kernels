@@ -20,4 +20,4 @@ QBLK is the QUERY_BLOCK_SIZE and KBLK is the KEY_BLOCK_SIZE.
 
 # NOTES:
 
-1. Tested with CUDA 12.2 and CUTLASS 3.3 and SM90A. 
+1. Tested with CUDA 12.2, CUTLASS 3.3 and SM90A. 
