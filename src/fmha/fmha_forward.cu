@@ -1,52 +1,21 @@
 /***************************************************************************************************
  * Copyright (c) 2017 - 2023 COLFAX
- * TODO: Fill copyright details.
+ * Distributed under MIT License
  **************************************************************************************************/
 
 /*! \file
     \brief FMHA Attention Example.
 
     This workload computes a fused multi head attention.
-    Because it keeps the attention matrix in shared memory, it's both faster and
-    uses less global memory.
+    Because it keeps the attention matrix in shared memory, it's both faster
+    and uses less global memory.
 
-    This is based on `"Self-Attention Does Not Need O(n^2) Memory"
-   <http://arxiv.org/abs/2112.05682>`_, and very similar to `"FlashAttention:
-   Fast and Memory-Efficient Exact Attention with IO-Awareness"
-   <https://arxiv.org/abs/2205.14135>`_.
+    The algorithm is based on `"FlashAttention-2: Faster Attention with Better
+    Parallelism and Work Partitioning" <https://arxiv.org/abs/2307.08691>`_.
 
-    Algorithm:
-      In short, we can compute the output incrementally in blocks of size B,
-      we just need to divide the final result by the sum of all coefficients in
-      the softmax (which we compute incrementally) with the following
-   pseudo-code:
-
-      ```
-      s_prime = torch.zeros([num_queries, B])
-      O = torch.zeros([num_queries, head_size_v])
-      for i in range(0, K.shape[0], B):
-        si = exp((Q . K[i * B:(i+1) * B].t) * scale)
-        sum_coefs += attn_unscaled.sum(-1)
-        O  += si . V[i * B:(i+1) * B]
-      O = O / s_prime
-      ```
-
-      In practice, and for numerical stability reasons,
-      we also substract the maximum so far (`mi`) before doing
-      the exponential. When we encounter new keys, the maximum
-      used to compute O so far (`m_prime`) can differ from the
-      current maximum, so we update O before accumulating with
-
-      ```
-      O       = O * exp(m_prime - mi)
-      m_prime = mi
-      ```
-
-    Implementation details:
-      - `mi` and `si` are stored in RMEM between the 2 back to back gemms.
-      - we keep and accumulate the output directly in registers.
-      - blocks are parallelized across the batch dimension (B), the number
-      of heads (H), and the query sequence size (M).
+    Many details of the code are explained in the companion paper `"A Case
+    Study in CUDA Kernel Fusion: Implementing FlashAttention-2 on NVIDIA
+    Hopper Architecture using the CUTLASS Library"`.
 
 */
 
@@ -103,7 +72,7 @@ struct SharedStorage {
 };
 
 // Reshape Utility for converting the layout from accumulator of GEMM-I
-// to Operanad A of GEMM-II.
+// to Operand A of GEMM-II.
 struct ReshapeTStoTP {
   template <class FragmentC, class FragmentQ>
   __device__ auto operator()(FragmentC &tC, FragmentQ &tQ) {
@@ -116,7 +85,7 @@ struct ReshapeTStoTP {
   }
 };
 
-// Converstion Utility to convert RMEM from one type to another.
+// Conversion Utility to convert RMEM from one type to another.
 // Used for conversion from AccumType to PrecType.
 template <typename To_type, typename From_type, typename Fragment>
 inline __device__ auto convert_type(Fragment const &tensor) {
@@ -167,7 +136,7 @@ fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
   // Shared memory barriers use 64bits in SMEM for synchronization
   uint64_t *tma_load_mbar = shared_storage.tma_load_mbar;
 
-  // Get the block co-ordinates for this CTA.
+  // Get the block coordinates for this CTA.
   auto blockIdxX = uint64_t(blockIdx.x);
   auto blockIdxH = uint64_t(blockIdx.y);
   auto blockIdxB = uint64_t(blockIdx.z);
@@ -193,7 +162,7 @@ fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
       make_tensor(make_smem_ptr(shared_storage.smem_v.data()), smemLayoutVt);
 
   // Get the full un-partitioned tensors.
-  // TMA tensors are sepcial tensors.
+  // TMA tensors are special tensors.
   Tensor mQ = tmaLoadQ.get_tma_tensor(shape(gmemLayoutQ));
   Tensor mK = tmaLoadK.get_tma_tensor(shape(gmemLayoutK));
   Tensor mV = tmaLoadV.get_tma_tensor(shape(gmemLayoutV));
@@ -212,7 +181,7 @@ fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
   auto cta_tmak = tmaLoadK.get_slice(0);
   auto cta_tmaV = tmaLoadV.get_slice(0);
 
-  // Get the block of Q for this CTA using the block co-ordinates.
+  // Get the block of Q for this CTA using the block coordinates.
   auto blkCoordQ = make_coord(blockIdxX, 0, blockIdxH, blockIdxB);
   Tensor gQ = local_tile(mQ, tileShapeQ, blkCoordQ);
 
@@ -340,7 +309,7 @@ fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
     cfk::gemm_bar_wait(tiledMma1, tOrP, tOrV, tOrO, tma_load_mbar[1]);
 #else
     // ISSUE GEMM-II with Operand A from RMEM.
-    // Convert Opreand A From AccumType [=float] to PrecType [=half_t] before
+    // Convert Operand A From AccumType [=float] to PrecType [=half_t] before
     // issuing.
     cfk::gemm_bar_wait(tiledMma1, convert_type<PrecType, AccumType>(tOrP), tOrV,
                        tOrO, tma_load_mbar[1]);
@@ -443,7 +412,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   auto tmak =
       make_tma_copy(SM90_TMA_LOAD{}, gK, smemLayoutK, tileShapeK, Int<1>{});
 
-  // Use only durign debugging, direct writes to GMEM.
+  // Use only during debugging, direct writes to GMEM.
   auto tileShapeS = make_shape(bM{}, bN{});
   Layout gmemLayoutS =
       make_layout(make_shape(M, N, H, B), make_stride(N, 1, N * M, H * M * N));
@@ -460,7 +429,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   auto tmaV =
       make_tma_copy(SM90_TMA_LOAD{}, gV, smemLayoutV, tileShapeV, Int<1>{});
 
-  // Layout for Vtranspose. For using in GEMM-II.
+  // Layout for Vtranspose. For use in GEMM-II.
   auto tileShapeVt = make_shape(bK{}, bN{});
   auto smemLayoutVt =
       composition(smemLayoutV, make_layout(tileShapeVt, GenRowMajor{}));
@@ -510,7 +479,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
       decltype(gmemLayoutV), decltype(smemLayoutV), decltype(smemLayoutVt),
       decltype(tileShapeO), decltype(gmemLayoutO), decltype(gmemLayoutMi)>;
 
-  // Compuate and set dynamic shared memory size.
+  // Compute and set dynamic shared memory size.
   auto smem_size = int(
       sizeof(SharedStorage<MmaA, decltype(smemLayoutQ), decltype(smemLayoutK),
                            decltype(smemLayoutS), decltype(smemLayoutV)>));
@@ -540,7 +509,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   // Compute the no. of tiles of K matrix.
   auto nTilesOfK = ceil_div(size(N), size(bN{}));
 
-  // Run the CUDA kernel for preferred number of iteations.
+  // Run the CUDA kernel for preferred number of iterations.
   for (int i = 0; i < iterations; ++i) {
     cutlass::Status status = cutlass::launch_kernel_on_cluster(
         params, kernel, ptrQ, tmaQ, tileShapeQ, gmemLayoutQ, smemLayoutQ, ptrK,
@@ -551,8 +520,8 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   }
 }
 
-// Wrapper function for mulitple-streams.
-// Currenlty, only single stream is used by default.
+// Wrapper function for multiple streams.
+// Currently, only single stream is used by default.
 template <typename PrecType, typename AccumType, int HEADDIM>
 void fmhaForwardDeviceLoop(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCHSIZE,
                            PrecType const *A, PrecType const *B, PrecType *V,
