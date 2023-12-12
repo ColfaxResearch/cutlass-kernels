@@ -555,14 +555,14 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
 // Currenlty, only single stream is used by default.
 template <typename PrecType, typename AccumType, int HEADDIM>
 void fmhaForwardDeviceLoop(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCHSIZE,
-                           PrecType const *A, PrecType const *B, PrecType *V,
-                           PrecType *Q, PrecType *D, AccumType *miOut,
+                           PrecType const *Q, PrecType const *K, PrecType *V,
+                           PrecType *S, PrecType *D, AccumType *miOut,
                            AccumType *sPrimeOut, int iterations, int nStreams,
                            float scale) {
 
   if (nStreams == 1) {
     fmhaForwardDevice<PrecType, AccumType, HEADDIM>(
-        SEQLEN, KEYLEN, NUMHEADS, BATCHSIZE, A, B, V, Q, D, miOut, sPrimeOut,
+        SEQLEN, KEYLEN, NUMHEADS, BATCHSIZE, Q, K, V, S, D, miOut, sPrimeOut,
         iterations, scale);
     return;
   } else {
@@ -571,16 +571,16 @@ void fmhaForwardDeviceLoop(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCHSIZE,
       cudaStream_t stream;
       cudaStreamCreate(&stream);
 
-      auto offsetA = i * SEQLEN * NUMHEADS * HEADDIM * L;
-      auto offsetB = i * KEYLEN * NUMHEADS * HEADDIM * L;
-      auto offsetQ = i * SEQLEN * NUMHEADS * KEYLEN * L;
+      auto offsetQ = i * SEQLEN * NUMHEADS * HEADDIM * L;
+      auto offsetK = i * KEYLEN * NUMHEADS * HEADDIM * L;
+      auto offsetS = i * SEQLEN * NUMHEADS * KEYLEN * L;
       auto offsetV = i * KEYLEN * NUMHEADS * HEADDIM * L;
       auto offsetD = i * SEQLEN * NUMHEADS * HEADDIM * L;
       auto miOffset = i * SEQLEN * NUMHEADS * L;
 
       fmhaForwardDevice<PrecType, AccumType, HEADDIM>(
-          SEQLEN, KEYLEN, NUMHEADS, L, A + offsetA, B + offsetB, V + offsetV,
-          Q + offsetQ, D + offsetD, miOut + miOffset, sPrimeOut + miOffset,
+          SEQLEN, KEYLEN, NUMHEADS, L, Q + offsetQ, K + offsetK, V + offsetV,
+          S + offsetS, D + offsetD, miOut + miOffset, sPrimeOut + miOffset,
           iterations, scale, stream);
     }
   }
@@ -655,7 +655,7 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
   GPU_Clock timer;
 
   double fmha_flops =
-      double (4 * batchSize * numHeads * mLong * nLong * kLong) / double(1.0e9);
+      double(4 * batchSize * numHeads * mLong * nLong * kLong) / double(1.0e9);
 
   // Run few times (warmup).
   devS = hostS;
@@ -677,7 +677,7 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
       devV.data().get(), devS.data().get(), devD.data().get(),
       devMiOut.data().get(), devSprimeOut.data().get(), iterations, nStreams,
       scale);
-  double cute_time = timer.seconds() / (float) timing_iterations;
+  double cute_time = timer.seconds() / (float)timing_iterations;
   CUTE_CHECK_LAST();
   printf("CUTE_FMHA:     [%6.1f]Gflop/s  "
          "(%6.4f)ms\n",
