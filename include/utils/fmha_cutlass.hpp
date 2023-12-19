@@ -211,7 +211,7 @@ public:
 
         cutlass::reference::device::GemmComplex<
             ElementQ, LayoutQ, ElementK, LayoutK, ElementP, LayoutP,
-            ElementCompute, ElementAccumulator>(
+            ElementAccumulator, ElementCompute>(
             problem0, ElementAccumulator(alphaMma0), view_Q,
             cutlass::ComplexTransform::kNone, view_K,
             cutlass::ComplexTransform::kNone, ElementAccumulator(beta), view_P,
@@ -304,7 +304,7 @@ public:
         // Reference GEMM-II.
         cutlass::reference::device::GemmComplex<
             ElementP, LayoutP, ElementV, LayoutV, ElementO, LayoutO,
-            ElementCompute, ElementAccumulator>(
+            ElementAccumulator, ElementCompute>(
             problem1, ElementAccumulator(alpha1), view_P,
             cutlass::ComplexTransform::kNone, view_V,
             cutlass::ComplexTransform::kNone, ElementAccumulator(beta), view_O,
