@@ -28,7 +28,6 @@ CUTLASS_DEVICE static void reorgCFp8toAFp8(Fragment &accum) {
   auto data = accum.data();
   int n = 0;
 
-  auto reduceMask = 0x66666666;
 #pragma unroll
   for (int i = 0; i < MT; ++i) {
 
