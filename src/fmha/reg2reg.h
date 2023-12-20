@@ -91,6 +91,8 @@ CUTLASS_DEVICE static void reorgCFp8toAFp8(Fragment &accum) {
   }
 }
 
+// First version (used for debugging)
+// TODO: Remove in future.
 template <typename Fragment>
 CUTLASS_DEVICE static void reorgCFp32toAFp8(Fragment &accum) {
 
