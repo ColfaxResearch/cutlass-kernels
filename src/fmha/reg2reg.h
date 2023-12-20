@@ -39,60 +39,48 @@ CUTLASS_DEVICE static void reorgCFp8toAFp8(Fragment &accum) {
 
       // d0, d1, d2, d3.
       int32_t upper;
-      cutlass::float_e4m3_t *byte0 = (cutlass::float_e4m3_t *)&upper + 0;
-      cutlass::float_e4m3_t *byte1 = (cutlass::float_e4m3_t *)&upper + 1;
-      cutlass::float_e4m3_t *byte2 = (cutlass::float_e4m3_t *)&upper + 2;
-      cutlass::float_e4m3_t *byte3 = (cutlass::float_e4m3_t *)&upper + 3;
+      cutlass::float_e4m3_t* byte0 = (cutlass::float_e4m3_t *)&upper + 0;
+      cutlass::float_e4m3_t* byte1 = (cutlass::float_e4m3_t *)&upper + 1;
+      cutlass::float_e4m3_t* byte2 = (cutlass::float_e4m3_t *)&upper + 2;
+      cutlass::float_e4m3_t* byte3 = (cutlass::float_e4m3_t *)&upper + 3;
 
       // d4, d5, d6, d7.
       int32_t lower;
-      cutlass::float_e4m3_t *byte4 = (cutlass::float_e4m3_t *)&lower + 0;
-      cutlass::float_e4m3_t *byte5 = (cutlass::float_e4m3_t *)&lower + 1;
-      cutlass::float_e4m3_t *byte6 = (cutlass::float_e4m3_t *)&lower + 2;
-      cutlass::float_e4m3_t *byte7 = (cutlass::float_e4m3_t *)&lower + 3;
+      cutlass::float_e4m3_t* byte4 = (cutlass::float_e4m3_t *)&lower + 0;
+      cutlass::float_e4m3_t* byte5 = (cutlass::float_e4m3_t *)&lower + 1;
+      cutlass::float_e4m3_t* byte6 = (cutlass::float_e4m3_t *)&lower + 2;
+      cutlass::float_e4m3_t* byte7 = (cutlass::float_e4m3_t *)&lower + 3;
 
-      *byte0 = data[n];
-      *byte1 = data[n + 1];
-      *byte2 = data[n + 2];
-      *byte3 = data[n + 3];
-      *byte4 = data[n + 4];
-      *byte5 = data[n + 5];
-      *byte6 = data[n + 6];
-      *byte7 = data[n + 7];
+	  *byte0 = data[n];
+	  *byte1 = data[n+1];
+	  *byte2 = data[n+2];
+	  *byte3 = data[n+3];
+	  *byte4 = data[n+4];
+	  *byte5 = data[n+5];
+	  *byte6 = data[n+6];
+	  *byte7 = data[n+7];
 
-      int32_t exVal0;
-      if (laneId % 4 == 0 || laneId % 4 == 1) {
-        exVal0 = lower;
+	  int32_t* exVal0;
+      if (laneId %  4 == 0 || laneId %  4 == 1 ) {
+        exVal0 = &lower;
       } else {
-        exVal0 = upper;
+        exVal0 = &upper;
       }
 
-      exVal0 = __shfl_xor_sync(uint32_t(-1), exVal0, 2);
+      *exVal0 = __shfl_xor_sync(uint32_t(-1), *exVal0, 2);
 
-      if (laneId % 4 == 0 || laneId % 4 == 1) {
-        lower = exVal0;
-      } else {
-        upper = exVal0;
-      }
-
-      int32_t exVal1;
+      int32_t* exVal1;
       if (laneId % 2 == 0) {
-        exVal1 = lower;
+        exVal1 = &lower;
       } else {
-        exVal1 = upper;
+        exVal1 = &upper;
       }
 
-      exVal1 = __shfl_xor_sync(uint32_t(-1), exVal1, 1);
+      *exVal1 = __shfl_xor_sync(uint32_t(-1), *exVal1, 1);
 
-      if (laneId % 2 == 0) {
-        lower = exVal1;
-      } else {
-        upper = exVal1;
-      }
-
-      data[n++] = *byte0;
-      data[n++] = *byte1;
-      data[n++] = *byte4;
+	  data[n++] = *byte0;
+	  data[n++] = *byte1;
+	  data[n++] = *byte4;
       data[n++] = *byte5;
 
       data[n++] = *byte2;
