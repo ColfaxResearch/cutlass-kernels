@@ -127,7 +127,8 @@ inline __device__ auto convert_type(Fragment const &tensor) {
 // PrecType = Precision of Computation used by GEMM (half_t by default).
 // SoftType = Type of Accumulator used by GEMM (float by default).
 // Other types are self-explanatory.
-template <class PrecType, class AccumType, class SoftType, class Gemm2Type,
+template <class PrecType, class AccumType, class SoftType, class Gemm2Type, 
+          class OutputType,
           class TiledMma0, class TiledMma1, class TiledCopyQ, class TileShapeQ,
           class GmemLayoutQ, class SmemLayoutQ, class TiledCopyK,
           class TileShapeK, class GmemLayoutK, class SmemLayoutK,
@@ -143,11 +144,11 @@ fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
             CUTE_GRID_CONSTANT TiledCopyK const tmaLoadK, TileShapeK tileShapeK,
             GmemLayoutK gmemLayoutK, SmemLayoutK smemLayoutK, PrecType *S,
             TileShapeS tileShapeS, GmemLayoutS gmemLayoutS,
-            SmemLayoutS smemLayoutS, int nTilesOfK, PrecType *V,
+            SmemLayoutS smemLayoutS, int nTilesOfK, Gemm2Type *V,
             CUTE_GRID_CONSTANT TiledCopyV const tmaLoadV, TileShapeV tileShapeV,
             GmemLayoutV gmemLayoutV, SmemLayoutV smemLayoutV,
             SmemLayoutVt smemLayoutVt, SrcSmemLayoutV srcSmemLayoutV,
-            SrcSmemLayoutAtomV srcSmemLayoutAtomV, PrecType *O,
+            SrcSmemLayoutAtomV srcSmemLayoutAtomV, OutputType *O,
             TileShapeD tileShapeO, GmemLayoutO gmemLayoutO, SoftType *mi_ptr,
             SoftType *sPrimePtr, GmemLayoutMI gmemLayoutMi, float scale) {
 
@@ -465,11 +466,11 @@ template <typename PrecType, int DIM> constexpr auto getSmemLayoutMN() {
 
 // Host method that prepares the data structures
 // required before calling the DEVICE kernel.
-template <typename PrecType, typename Gemm2Type, typename SoftType, int HEADDIM>
+template <typename PrecType, typename Gemm2Type, typename SoftType, typename OutputType, int HEADDIM>
 void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
                        PrecType const *tensorQ, PrecType const *tensorK,
                        Gemm2Type const *tensorV, PrecType *tensorS,
-                       PrecType *tensorO, SoftType *miOut, SoftType *sPrimeOut,
+                       OutputType *tensorO, SoftType *miOut, SoftType *sPrimeOut,
                        int iterations, float scale, cudaStream_t stream = 0) {
   using namespace cute;
 
@@ -637,7 +638,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
 
   // Get the ptr to kernel function.
   void const *kernel = (void const *)fmhaForward<
-      PrecType, MmaC, SoftType, Mma2A, TiledMma0, TiledMma1, decltype(tmaQ),
+      PrecType, MmaC, SoftType, Mma2A, OutputType, TiledMma0, TiledMma1, decltype(tmaQ),
       decltype(tileShapeQ), decltype(gmemLayoutQ), decltype(smemLayoutQ),
       decltype(tmak), decltype(tileShapeK), decltype(gmemLayoutK),
       decltype(smemLayoutK), decltype(tileShapeS), decltype(gmemLayoutS),
@@ -690,15 +691,15 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
 
 // Wrapper function for multiple streams.
 // Currently, only single stream is used by default.
-template <typename PrecType, typename Gemm2Type, typename SoftType, int HEADDIM>
+template <typename PrecType, typename Gemm2Type, typename SoftType, typename OutputType, int HEADDIM>
 void fmhaForwardDeviceLoop(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCHSIZE,
                            PrecType const *Q, PrecType const *K, Gemm2Type *V,
-                           PrecType *S, PrecType *D, SoftType *miOut,
+                           PrecType *S, OutputType *D, SoftType *miOut,
                            SoftType *sPrimeOut, int iterations, int nStreams,
                            float scale) {
 
   if (nStreams == 1) {
-    fmhaForwardDevice<PrecType, Gemm2Type, SoftType, HEADDIM>(
+    fmhaForwardDevice<PrecType, Gemm2Type, SoftType, OutputType, HEADDIM>(
         SEQLEN, KEYLEN, NUMHEADS, BATCHSIZE, Q, K, V, S, D, miOut, sPrimeOut,
         iterations, scale);
     return;
@@ -715,7 +716,7 @@ void fmhaForwardDeviceLoop(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCHSIZE,
       auto offsetD = i * SEQLEN * NUMHEADS * HEADDIM * L;
       auto miOffset = i * SEQLEN * NUMHEADS * L;
 
-      fmhaForwardDevice<PrecType, Gemm2Type, SoftType, HEADDIM>(
+      fmhaForwardDevice<PrecType, Gemm2Type, SoftType, OutputType, HEADDIM>(
           SEQLEN, KEYLEN, NUMHEADS, L, Q + offsetQ, K + offsetK, V + offsetV,
           S + offsetS, D + offsetD, miOut + miOffset, sPrimeOut + miOffset,
           iterations, scale, stream);
@@ -773,12 +774,13 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
   std::cout << "L = " << lLong << " : " << numHeads << " * " << batchSize
             << std::endl;
 
+  using OutputType = cutlass::half_t;
   thrust::device_vector<PrecType> devQ(mLong * kLong * lLong);
   thrust::device_vector<PrecType> devK(nLong * kLong * lLong);
   thrust::device_vector<PrecType> devS(mLong * nLong * lLong);
   thrust::device_vector<Gemm2Type> devV(nLong * kLong * lLong);
   thrust::device_vector<Gemm2Type> devVt(nLong * kLong * lLong);
-  thrust::device_vector<PrecType> devD(mLong * kLong * lLong);
+  thrust::device_vector<OutputType> devD(mLong * kLong * lLong);
 
   uint32_t seed = 3080;
 
@@ -799,7 +801,7 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
   cfk::initialize_rand(devK.data().get(), devK.size(), initK, seed + 2);
   cfk::initialize_rand(devV.data().get(), devV.size(), initV, seed + 3);
   cfk::initialize_const(devS.data().get(), devS.size(), PrecType(-1));
-  cfk::initialize_const(devD.data().get(), devD.size(), PrecType(-1));
+  cfk::initialize_const(devD.data().get(), devD.size(), OutputType(-1));
 
   using SoftType = float; // SoftType is always float.
 
@@ -807,7 +809,7 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
   thrust::host_vector<PrecType> hostK = devK;
   thrust::host_vector<PrecType> hostS = devS;
   thrust::host_vector<Gemm2Type> hostV = devV;
-  thrust::host_vector<PrecType> hostD = devD;
+  thrust::host_vector<OutputType> hostD = devD;
 
 #ifdef VTRANS
   thrust::host_vector<Gemm2Type> hostVt = hostV;
@@ -845,10 +847,6 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
                        p + r * 2 + q * 8] =
                     hostVt[B * batchStride + K * kStrideT + H * headStrideT +
                            M + p + q * 2 + r * 4];
-                // hostVp[B * batchStride + K * kStrideT + H * headStrideT + M
-                // + p + q * 2 + r * 4]
-                //  = hostVt[B * batchStride + K * kStrideT + H * headStrideT
-                //  + M + p + r * 2 + q * 8];
               }
             }
           }
@@ -877,7 +875,7 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
   // Run few times (warmup).
   devS = hostS;
   devD = hostD;
-  fmhaForwardDeviceLoop<PrecType, Gemm2Type, SoftType, HEADDIM>(
+  fmhaForwardDeviceLoop<PrecType, Gemm2Type, SoftType, OutputType, HEADDIM>(
       m, n, numHeads, batchSize, devQ.data().get(), devK.data().get(),
       devVt.data().get(), devS.data().get(), devD.data().get(),
       devMiOut.data().get(), devSprimeOut.data().get(), 10, nStreams, scale);
@@ -887,7 +885,7 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
   devS = hostS;
   devD = hostD;
   timer.start();
-  fmhaForwardDeviceLoop<PrecType, Gemm2Type, SoftType, HEADDIM>(
+  fmhaForwardDeviceLoop<PrecType, Gemm2Type, SoftType, OutputType, HEADDIM>(
       m, n, numHeads, batchSize, devQ.data().get(), devK.data().get(),
       devVt.data().get(), devS.data().get(), devD.data().get(),
       devMiOut.data().get(), devSprimeOut.data().get(), iterations, nStreams,
