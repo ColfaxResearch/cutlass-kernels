@@ -14,6 +14,41 @@
 #include <cute/tensor.hpp>
 
 template <typename Fragment>
+CUTLASS_DEVICE static void reorgCFp8toAFp8NoShfl(Fragment &accum) {
+
+  using namespace cute;
+  auto laneId = cutlass::canonical_lane_idx();
+
+  // First update `mi` to the max per-row
+  //
+  auto VT = shape<0>(accum); // number of vector elements per tile.
+  auto MT = shape<1>(accum); // number of tiles along M.
+  auto NT = shape<2>(accum); // number of tiles along N.
+
+  auto data = accum.data();
+  int n = 0;
+
+#pragma unroll
+  for (int i = 0; i < MT; ++i) {
+
+    // Traverse 2-rows + 2-cols (2x2) simultaneously.
+
+#pragma unroll
+    for (int k = 0; k < NT * size<2>(VT) / 2; ++k) {
+
+      auto tmp0 = data[n + 2];
+      auto tmp1 = data[n + 3];
+      data[n + 2] = data[n + 4];
+      data[n + 3] = data[n + 5];
+
+      data[n + 4] = tmp0;
+      data[n + 5] = tmp1;
+      n += 8;
+    }
+  }
+}
+
+template <typename Fragment>
 CUTLASS_DEVICE static void reorgCFp8toAFp8(Fragment &accum) {
 
   using namespace cute;

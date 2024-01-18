@@ -302,6 +302,7 @@ public:
             block_Ref_P.get(), matrix_Ref.data(), matrix_Ref.size());
 
         // Reference GEMM-II.
+        using Gemm2Type = cutlass::half_t;
         cutlass::reference::device::GemmComplex<
             ElementP, LayoutP, ElementV, LayoutV, ElementO, LayoutO,
             ElementAccumulator, ElementCompute>(
