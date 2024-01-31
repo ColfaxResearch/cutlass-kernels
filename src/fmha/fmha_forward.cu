@@ -315,17 +315,28 @@ fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
                        tOrO, tma_load_mbar[1]);
 #endif
   }
-
-  // Copy output Tile from RMEM to GMEM directly.
-  auto blkCoordO = make_coord(blockIdxX, 0, blockIdxH, blockIdxB);
-  Tensor gO = local_tile(mO, tileShapeO, blkCoordO);
-  Tensor tOgO = threadMma1.partition_C(gO);
-
+  
   // Apply softmax normalization before writing out to GMEM.
   applySoftmaxNormalizer<AccumType>(rowSum, tOrO);
 
-  // Write out to GMEM.
-  copy(tOrO, tOgO);
+  // Copy output Tile from RMEM to SMEM, overwriting sQ
+  Tensor tOsOAcc = threadMma1.partition_C(sQ);
+  cfk::copy(tOrO, tOsOAcc);
+
+  // Do coalesced store to GMEM
+  auto blkCoordO = make_coord(blockIdxX, 0, blockIdxH, blockIdxB);
+  Tensor gO = local_tile(mO, tileShapeO, blkCoordO);
+  auto tO = make_layout(make_shape(Int<2>{}, Int<64>{}));
+  
+  auto tOgO = local_partition(gO, tO, threadIdx.x, Step<_1,_1>{});
+  auto tOsO = local_partition(sQ, tO, threadIdx.x, Step<_1,_1>{});
+
+  copy(tOsO, tOgO);
+  
+  // Former code for writing out RMEM to GMEM directly
+  // This reports as uncoalesced GMEM access by the profiler
+  // Tensor tOgO = threadMma1.partition_C(gO);
+  // copy(tOrO, tOgO);
 
 // Write out rowMax and rowSum to GMEM.
 // Required for verification ONLY.
