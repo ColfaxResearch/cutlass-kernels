@@ -23,6 +23,7 @@ fi
 if [[ $3 == "CTA256" ]];
 then
 QBLKSIZES=( 128 )
+KBLKSIZES=( 64 128 256 )
 fi
 
 for QBLK in "${QBLKSIZES[@]}"

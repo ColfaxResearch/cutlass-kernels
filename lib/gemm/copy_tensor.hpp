@@ -24,8 +24,7 @@ __device__ void barrierInit(uint64_t &tma_load_mbar, int numThreads) {
   cutlass::arch::fence_barrier_init();
 }
 
-template <class ClusterShape>
-__device__ void syncCluster(uint64_t &tma_load_mbar) {
+template <class ClusterShape> __device__ void syncCluster() {
   if constexpr (size(ClusterShape{}) > 1) {
     cute::cluster_sync();
   }
@@ -49,13 +48,6 @@ __device__ void copy(Tensor<SrcEngine, SrcLayout> const &gX,
     cute::set_barrier_transaction_bytes(tma_load_mbar, kTmaTransactionBytes);
     copy(tma_load_x.with(tma_load_mbar, mcast_mask_a), gX, sX);
   }
-
-  __syncthreads();
-
-  /// Wait on the shared memory barrier until the phase bit flips from
-  /// kPhaseBit value
-  constexpr int kPhaseBit = 0;
-  cute::wait_barrier(tma_load_mbar, kPhaseBit);
 }
 
 template <typename SrcEngineA, typename SrcLayoutA, typename SrcEngineB,
@@ -78,7 +70,6 @@ copy(Tensor<SrcEngineA, SrcLayoutA> const &gA,
       size(SrcLayoutA{}) * sizeof_bits_v<SrcTypeA> / 8 +
       size(SrcLayoutB{}) * sizeof_bits_v<SrcTypeB> / 8;
 
-  //  __syncthreads();
   int warp_idx = cutlass::canonical_warp_idx_sync();
   int lane_predicate = cute::elect_one_sync();
   if (warp_idx == 0 and lane_predicate) {
@@ -86,40 +77,10 @@ copy(Tensor<SrcEngineA, SrcLayoutA> const &gA,
     copy(tma_load_a.with(tma_load_mbar, mcast_mask_a), gA, sA);
     copy(tma_load_b.with(tma_load_mbar, mcast_mask_b), gB, sB);
   }
-  __syncthreads();
-
-  /// Wait on the shared memory barrier until the phase bit flips from
-  /// kPhaseBit value
-  constexpr int kPhaseBit = 0;
-  cute::wait_barrier(tma_load_mbar, kPhaseBit);
-}
-template <typename SrcEngine, typename SrcLayout, typename DstEngine,
-          typename DstLayout, typename AtomX, class... ArgsX>
-__device__ void copy_nobar(Tensor<SrcEngine, SrcLayout> const &gX,
-                           Tensor<DstEngine, DstLayout> &&sX,
-                           TiledCopy<AtomX, ArgsX...> const &tma_load_x,
-                           uint64_t &tma_load_mbar, uint16_t mcast_mask_a = 0) {
-
-  using SrcType = typename AtomX::ValType;
-  // Set the bytes transferred in this TMX transaction (may involve multiple
-  // issues)
-  constexpr int kTmaTransactionBytes =
-      size(SrcLayout{}) * sizeof_bits_v<SrcType> / 8;
-
-  //__syncthreads();
-  int warp_idx = cutlass::canonical_warp_idx_sync();
-  int lane_predicate = cute::elect_one_sync();
-  if (warp_idx == 0 and lane_predicate) {
-    cute::set_barrier_transaction_bytes(tma_load_mbar, kTmaTransactionBytes);
-    copy(tma_load_x.with(tma_load_mbar, mcast_mask_a), gX, sX);
-  }
-
-  __syncthreads();
 }
 
 template <typename TensorA, typename TensorB>
 __device__ void copy(const TensorA &tA, TensorB &tB) {
-  warpgroup_arrive();
   __syncthreads();
   copy(tA, tB);
   cp_async_fence();

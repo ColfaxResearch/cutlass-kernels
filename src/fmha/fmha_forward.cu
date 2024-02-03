@@ -58,12 +58,6 @@ constexpr int kKeysPerBlock = KBLKSIZE;
 constexpr int kKeysPerBlock = 64;
 #endif
 
-#ifdef CTA256
-const int NumMmaWarpGroups = 2;
-#else
-const int NumMmaWarpGroups = 1;
-#endif
-
 // Shared Storage with Aligned addresses.
 template <class ElementType, class SmemLayoutQ, class SmemLayoutK,
           class SmemLayoutS, class SmemLayoutV>
@@ -258,16 +252,17 @@ fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
   cute::cluster_arrive_relaxed();
   cute::cluster_wait();
 
-  cfk::barrierInit(tma_load_mbar[0], 1);
-  cfk::barrierInit(tma_load_mbar[1], 1);
-  cfk::barrierInit(tma_load_mbar[2], 1);
-  cfk::barrierInit(tma_load_mbar[3], cluster_shape_x);
-
   int warp_idx = cutlass::canonical_warp_idx_sync();
   int lane_predicate = cute::elect_one_sync();
 
+  // Barrier 0-2 are transaction-bytes based. numthreads = 1 for them.
+  cfk::barrierInit(tma_load_mbar[0], 1);
+  cfk::barrierInit(tma_load_mbar[1], 1);
+  cfk::barrierInit(tma_load_mbar[2], 1);
+
   // Copy Q tile from GMEM to SMEM.
   cfk::copy(tQgQ(_, 0), tQsQ(_, 0), tmaLoadQ, tma_load_mbar[2]);
+  cute::wait_barrier(tma_load_mbar[2], 0); // This is REQUIRED.
 
   auto blkCoordK = make_coord(0, 0, blockIdxH, blockIdxB);
 
@@ -280,8 +275,7 @@ fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
   static_assert(size<1>(tKsK) == 1);
 
   // Copy first tile of K from GMEM to SMEM.
-  cfk::copy_nobar(tKgK(_, 0), tKsK(_, 0), tmaLoadK, tma_load_mbar[0],
-                  mcast_mask_a);
+  cfk::copy(tKgK(_, 0), tKsK(_, 0), tmaLoadK, tma_load_mbar[0], mcast_mask_a);
 
   int phase = 0;
 #pragma unroll
@@ -298,14 +292,12 @@ fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
 
     // Copy current tile of V from GMEM to SMEM.
 
-    cfk::syncCluster<ClusterShape>(tma_load_mbar[3]);
-    cfk::copy_nobar(tVgV(_, 0), tVsV(_, 0), tmaLoadV, tma_load_mbar[1],
-                    mcast_mask_a);
+    cfk::syncCluster<ClusterShape>();
+    cfk::copy(tVgV(_, 0), tVsV(_, 0), tmaLoadV, tma_load_mbar[1], mcast_mask_a);
     clear(tSrS);
 
     // Issue GEMM-I.
-    cute::wait_barrier(tma_load_mbar[0], phase);
-    cfk::gemm(tiledMma0, tSrQ, tSrK, tSrS);
+    cfk::gemm_ldbar(tiledMma0, tSrQ, tSrK, tSrS, tma_load_mbar[0], phase);
 
 // Required for verification ONLY.
 #ifdef COPYOUTMM0
@@ -324,9 +316,9 @@ fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
 
       Tensor tKgKX = cta_tmak.partition_S(gK);
       Tensor tKgK = group_modes<1, rank(tKgKX)>(tKgKX);
-      cfk::syncCluster<ClusterShape>(tma_load_mbar[3]);
-      cfk::copy_nobar(tKgK(_, 0), tKsK(_, 0), tmaLoadK, tma_load_mbar[0],
-                      mcast_mask_a);
+      cfk::syncCluster<ClusterShape>();
+      cfk::copy(tKgK(_, 0), tKsK(_, 0), tmaLoadK, tma_load_mbar[0],
+                mcast_mask_a);
     }
 
     if (blockIdxY == 0) { // Compute Online Softmax and NO Output Rescaling.
@@ -342,13 +334,13 @@ fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
     // ISSUE GEMM-II with Operand A from SMEM.
     // Copy OperandA from RMEM to SMEM before issuing.
     cfk::copy(tSrS, tSsS);
-    cfk::gemm_bar_wait(tiledMma1, tOrP, tOrV, tOrO, tma_load_mbar[1]);
+    cfk::gemm_ldbar(tiledMma1, tOrP, tOrV, tOrO, tma_load_mbar[1], phase);
 #else
     // ISSUE GEMM-II with Operand A from RMEM.
     // Convert Operand A From AccumType [=float] to PrecType [=half_t] before
     // issuing.
-    cute::wait_barrier(tma_load_mbar[1], phase);
-    cfk::gemm(tiledMma1, convert_type<PrecType, AccumType>(tOrP), tOrV, tOrO);
+    cfk::gemm_ldbar(tiledMma1, convert_type<PrecType, AccumType>(tOrP), tOrV,
+                    tOrO, tma_load_mbar[1], phase);
 #endif
     phase = (phase + 1) % 2;
   }
@@ -366,12 +358,12 @@ fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
 
   // Partition the copying of source tiles for O among threads.
   Tensor tOgOX = cta_tmaO.partition_D(gO);
-  Tensor tOgO = group_modes<1, rank(tOgOX)>(tOgOX); 
+  Tensor tOgO = group_modes<1, rank(tOgOX)>(tOgOX);
   assert(size<1>(tOgO) == 1);
 
   // Partition the copying of src tiles for O.
   Tensor tOsOX = cta_tmaO.partition_S(sQ);
-  Tensor tOsO = group_modes<1, rank(tOsOX)>(tOsOX); 
+  Tensor tOsO = group_modes<1, rank(tOsOX)>(tOsOX);
   static_assert(size<1>(tOsO) == 1);
 
   // Issue the TMA store.
@@ -390,6 +382,11 @@ fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
 // Write out rowMax and rowSum to GMEM.
 // Required for verification ONLY.
 #ifdef COPYOUTMI
+#ifdef CTA256
+  const int NumMmaWarpGroups = 2;
+#else
+  const int NumMmaWarpGroups = 1;
+#endif
   Tensor miGlobal = make_tensor(make_gmem_ptr(mi_ptr), gmemLayoutMi);
   Tensor miGlobalOut =
       local_tile(miGlobal, make_shape(get<0>(tileShapeQ), 1, 1),
