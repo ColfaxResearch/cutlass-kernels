@@ -22,9 +22,7 @@ __device__ void gemm(TiledMma &tiled_mma, const Tensor<TA, LayoutA> &tCrA,
   warpgroup_commit_batch();
   warpgroup_wait<0>();
   warpgroup_fence_operand(tCrC);
-#ifdef CTA256
   __syncthreads(); // This is required for CTA 256.
-#endif
 }
 
 template <typename TA, typename LayoutA, typename TB, typename LayoutB,
@@ -44,8 +42,6 @@ __device__ void gemm_ldbar(TiledMma &tiled_mma, const Tensor<TA, LayoutA> &tCrA,
   warpgroup_commit_batch();
   warpgroup_wait<0>();
   warpgroup_fence_operand(tCrC);
-#ifdef CTA256
-  __syncthreads(); // This is required for CTA 256.
-#endif
+  __syncthreads(); 
 }
 } // namespace cfk

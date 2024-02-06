@@ -42,12 +42,15 @@ __device__ void copy(Tensor<SrcEngine, SrcLayout> const &gX,
   constexpr int kTmaTransactionBytes =
       size(SrcLayout{}) * sizeof_bits_v<SrcType> / 8;
 
+  __syncthreads();
+
   int warp_idx = cutlass::canonical_warp_idx_sync();
   int lane_predicate = cute::elect_one_sync();
   if (warp_idx == 0 and lane_predicate) {
     cute::set_barrier_transaction_bytes(tma_load_mbar, kTmaTransactionBytes);
     copy(tma_load_x.with(tma_load_mbar, mcast_mask_a), gX, sX);
   }
+  __syncthreads();
 }
 
 template <typename SrcEngineA, typename SrcLayoutA, typename SrcEngineB,
@@ -66,6 +69,7 @@ copy(Tensor<SrcEngineA, SrcLayoutA> const &gA,
   using SrcTypeB = typename AtomB::ValType;
   // Set the bytes transferred in this TMX transaction (may involve multiple
   // issues)
+  __syncthreads();
   constexpr int kTmaTransactionBytes =
       size(SrcLayoutA{}) * sizeof_bits_v<SrcTypeA> / 8 +
       size(SrcLayoutB{}) * sizeof_bits_v<SrcTypeB> / 8;
@@ -77,6 +81,7 @@ copy(Tensor<SrcEngineA, SrcLayoutA> const &gA,
     copy(tma_load_a.with(tma_load_mbar, mcast_mask_a), gA, sA);
     copy(tma_load_b.with(tma_load_mbar, mcast_mask_b), gB, sB);
   }
+  __syncthreads();
 }
 
 template <typename TensorA, typename TensorB>
