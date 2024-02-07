@@ -68,7 +68,7 @@ struct SharedStorage {
 #ifdef SINSMEM
   cute::array_aligned<ElementType, cute::cosize_v<SmemLayoutS>> smem_s;
 #endif
-  cute::uint64_t tma_load_mbar[2];
+  cute::uint64_t tma_load_mbar[8];
 };
 
 // Reshape Utility for converting the layout from accumulator of GEMM-I
@@ -79,7 +79,7 @@ struct ReshapeTStoTP {
 
     // get the layout of one row of Q.
     auto layoutQRow = make_ordered_layout(tQ(_, 0, _).layout());
-    // get the layout of  M dimension of C.
+    // get the layout of M dimension of C.
     auto layoutCM = get<1>(tC.layout());
     return make_layout(get<0>(layoutQRow), layoutCM, get<1>(layoutQRow));
   }
@@ -108,8 +108,8 @@ template <class PrecType, class AccumType, class TiledMma0, class TiledMma1,
           class GmemLayoutK, class SmemLayoutK, class TileShapeS,
           class GmemLayoutS, class SmemLayoutS, class TiledCopyV,
           class TileShapeV, class GmemLayoutV, class SmemLayoutV,
-          class SmemLayoutVt, class TileShapeD, class GmemLayoutO,
-          class GmemLayoutMI>
+          class SmemLayoutVt, class TiledCopyO, class TileShapeO,
+          class GmemLayoutO, class GmemLayoutMI, class ClusterShape>
 __global__ static void //__launch_bounds__(128, 2)
 fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
             TileShapeQ tileShapeQ, GmemLayoutQ gmemLayoutQ,
@@ -120,9 +120,10 @@ fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
             SmemLayoutS smemLayoutS, int nTilesOfK, PrecType *V,
             CUTE_GRID_CONSTANT TiledCopyV const tmaLoadV, TileShapeV tileShapeV,
             GmemLayoutV gmemLayoutV, SmemLayoutV smemLayoutV,
-            SmemLayoutVt smemLayoutVt, PrecType *O, TileShapeD tileShapeO,
-            GmemLayoutO gmemLayoutO, AccumType *mi_ptr, AccumType *sPrimePtr,
-            GmemLayoutMI gmemLayoutMi, float scale) {
+            SmemLayoutVt smemLayoutVt, PrecType *O,
+            CUTE_GRID_CONSTANT TiledCopyO const tmaStoreO,
+            TileShapeO tileShapeO, GmemLayoutO gmemLayoutO, AccumType *mi_ptr,
+            AccumType *sPrimePtr, GmemLayoutMI gmemLayoutMi, float scale) {
 
   using namespace cute;
 
@@ -166,20 +167,33 @@ fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
   Tensor mQ = tmaLoadQ.get_tma_tensor(shape(gmemLayoutQ));
   Tensor mK = tmaLoadK.get_tma_tensor(shape(gmemLayoutK));
   Tensor mV = tmaLoadV.get_tma_tensor(shape(gmemLayoutV));
-  Tensor mO = make_tensor(make_gmem_ptr(O), gmemLayoutO);
+  Tensor mO = tmaStoreO.get_tma_tensor(shape(gmemLayoutO));
 
   TiledMma0 tiledMma0;
   auto threadMma0 = tiledMma0.get_thread_slice(threadIdx.x);
   TiledMma1 tiledMma1;
   auto threadMma1 = tiledMma1.get_thread_slice(threadIdx.x);
 
+  uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
+  constexpr uint32_t cluster_shape_x = get<0>(ClusterShape{});
+  uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x,
+                                  block_rank_in_cluster / cluster_shape_x};
+  uint16_t mcast_mask_a = 0;
+  auto block_layout = Layout<ClusterShape>{}; // (m,n) -> block_id
+  for (int n = 0; n < size(block_layout); ++n) {
+    mcast_mask_a |= (uint16_t(1) << block_layout(n, 0, Int<0>{}));
+  }
+
   //
-  // Prepare the TMA_LOADS. Currently, our cluster size is one.
-  // So, use only the 0th slice.
+  // Prepare the TMA_LOADS and TMA_STORE.
+  // Always use the 0th slice for Q and O.
+  // Slice for K and V is dependent on CTA id in cluster.
+  // This will be 0 as well for trivial ClusterShape.
   //
+  auto cta_tmaO = tmaStoreO.get_slice(0);
   auto cta_tmaQ = tmaLoadQ.get_slice(0);
-  auto cta_tmak = tmaLoadK.get_slice(0);
-  auto cta_tmaV = tmaLoadV.get_slice(0);
+  auto cta_tmak = tmaLoadK.get_slice(cluster_local_block_id.x);
+  auto cta_tmaV = tmaLoadV.get_slice(cluster_local_block_id.x);
 
   // Get the block of Q for this CTA using the block coordinates.
   auto blkCoordQ = make_coord(blockIdxX, 0, blockIdxH, blockIdxB);
@@ -238,13 +252,25 @@ fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
   cute::fill(rowMax, -cutlass::platform::numeric_limits<AccumType>::infinity());
   cute::fill(rowSum, AccumType(0.0));
 
+  cute::cluster_arrive_relaxed();
+  cute::cluster_wait();
+
+  int warp_idx = cutlass::canonical_warp_idx_sync();
+  int lane_predicate = cute::elect_one_sync();
+
+  // Barrier 0-2 are transaction-bytes based. numthreads = 1 for them.
+  // Barrier 0 is used for K copy, 1 for V copy, and 2 for Q copy.
+  cfk::barrierInit(tma_load_mbar[0], 1);
+  cfk::barrierInit(tma_load_mbar[1], 1);
+  cfk::barrierInit(tma_load_mbar[2], 1);
+
   // Copy Q tile from GMEM to SMEM.
-  cfk::copy(tQgQ(_, 0), tQsQ(_, 0), tmaLoadQ, tma_load_mbar[0]);
+  cfk::copy(tQgQ(_, 0), tQsQ(_, 0), tmaLoadQ, tma_load_mbar[2]);
+  cute::wait_barrier(tma_load_mbar[2], 0); // This is REQUIRED.
 
+  // Prepare Tensors for first K copy on GMEM side.
   auto blkCoordK = make_coord(0, 0, blockIdxH, blockIdxB);
-
   Tensor gK = local_tile(mK, tileShapeK, blkCoordK);
-
   Tensor tKgKX = cta_tmak.partition_S(gK);
   Tensor tKgK = group_modes<1, rank(tKgKX)>(tKgKX); // (TMA,REST)
   assert(size<1>(tKgK) == size<2>(gK));
@@ -252,26 +278,29 @@ fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
   static_assert(size<1>(tKsK) == 1);
 
   // Copy first tile of K from GMEM to SMEM.
-  cfk::copy_nobar(tKgK(_, 0), tKsK(_, 0), tmaLoadK, tma_load_mbar[0]);
+  cfk::copy(tKgK(_, 0), tKsK(_, 0), tmaLoadK, tma_load_mbar[0], mcast_mask_a);
+  
+  // Initialize phase for barriers 0 and 1.
+  int phase = 0;
 
 #pragma unroll
   for (uint64_t blockIdxY = 0; blockIdxY < nTilesOfK; ++blockIdxY) {
 
+    // Prepare Tensors for V copy on GMEM side.
     auto blkCoordV = make_coord(blockIdxY, 0, blockIdxH, blockIdxB);
     Tensor gV = local_tile(mV, tileShapeV, blkCoordV);
-
     Tensor tVgVX = cta_tmaV.partition_S(gV);
-
     Tensor tVgV = group_modes<1, rank(tVgVX)>(tVgVX);
     assert(size<1>(tVgV) == size<2>(gV));
     assert(size<1>(tVgV) == 1);
 
     // Copy current tile of V from GMEM to SMEM.
-    cfk::copy_nobar(tVgV(_, 0), tVsV(_, 0), tmaLoadV, tma_load_mbar[1]);
+    cfk::syncCluster<ClusterShape>();
+    cfk::copy(tVgV(_, 0), tVsV(_, 0), tmaLoadV, tma_load_mbar[1], mcast_mask_a);
     clear(tSrS);
 
     // Issue GEMM-I.
-    cfk::gemm_bar_wait(tiledMma0, tSrQ, tSrK, tSrS, tma_load_mbar[0]);
+    cfk::gemm_ldbar(tiledMma0, tSrQ, tSrK, tSrS, tma_load_mbar[0], phase);
 
 // Required for verification ONLY.
 #ifdef COPYOUTMM0
@@ -285,12 +314,13 @@ fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
     // Copy next tile of K from GMEM to SMEM.
     if (blockIdxY != (nTilesOfK - 1)) {
       auto blkCoordK = make_coord(blockIdxY + 1, 0, blockIdxH, blockIdxB);
-
       auto gK = local_tile(mK, tileShapeK, blkCoordK);
 
       Tensor tKgKX = cta_tmak.partition_S(gK);
       Tensor tKgK = group_modes<1, rank(tKgKX)>(tKgKX);
-      cfk::copy_nobar(tKgK(_, 0), tKsK(_, 0), tmaLoadK, tma_load_mbar[0]);
+      cfk::syncCluster<ClusterShape>();
+      cfk::copy(tKgK(_, 0), tKsK(_, 0), tmaLoadK, tma_load_mbar[0],
+                mcast_mask_a);
     }
 
     if (blockIdxY == 0) { // Compute Online Softmax and NO Output Rescaling.
@@ -306,33 +336,45 @@ fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
     // ISSUE GEMM-II with Operand A from SMEM.
     // Copy OperandA from RMEM to SMEM before issuing.
     cfk::copy(tSrS, tSsS);
-    cfk::gemm_bar_wait(tiledMma1, tOrP, tOrV, tOrO, tma_load_mbar[1]);
+    cfk::gemm_ldbar(tiledMma1, tOrP, tOrV, tOrO, tma_load_mbar[1], phase);
 #else
     // ISSUE GEMM-II with Operand A from RMEM.
     // Convert Operand A From AccumType [=float] to PrecType [=half_t] before
     // issuing.
-    cfk::gemm_bar_wait(tiledMma1, convert_type<PrecType, AccumType>(tOrP), tOrV,
-                       tOrO, tma_load_mbar[1]);
+    cfk::gemm_ldbar(tiledMma1, convert_type<PrecType, AccumType>(tOrP), tOrV,
+                    tOrO, tma_load_mbar[1], phase);
 #endif
+    // Flip phase for barrier.
+    phase = (phase + 1) % 2;
   }
-  
+
   // Apply softmax normalization before writing out to GMEM.
   applySoftmaxNormalizer<AccumType>(rowSum, tOrO);
 
-  // Copy output Tile from RMEM to SMEM, overwriting sQ
+  // Copy output tile O from RMEM to SMEM, overwriting sQ.
   Tensor tOsOAcc = threadMma1.partition_C(sQ);
   cfk::copy(tOrO, tOsOAcc);
-
-  // Do coalesced store to GMEM
+  
+  // Prepare Tensors for writing out O on GMEM side.
   auto blkCoordO = make_coord(blockIdxX, 0, blockIdxH, blockIdxB);
   Tensor gO = local_tile(mO, tileShapeO, blkCoordO);
-  auto tO = make_layout(make_shape(Int<2>{}, Int<64>{}));
-  
-  auto tOgO = local_partition(gO, tO, threadIdx.x, Step<_1,_1>{});
-  auto tOsO = local_partition(sQ, tO, threadIdx.x, Step<_1,_1>{});
+  Tensor tOgOX = cta_tmaO.partition_D(gO);
+  Tensor tOgO = group_modes<1, rank(tOgOX)>(tOgOX);
+  assert(size<1>(tOgO) == 1);
 
-  copy(tOsO, tOgO);
-  
+  // Partition the copying of SMEM tile for O among threads.
+  Tensor tOsOX = cta_tmaO.partition_S(sQ);
+  Tensor tOsO = group_modes<1, rank(tOsOX)>(tOsOX);
+  static_assert(size<1>(tOsO) == 1);
+
+  // Issue the TMA store.
+  if (warp_idx == 0 and lane_predicate) {
+    cute::copy(tmaStoreO, tOsO, tOgO);
+  }
+
+  // Wait for TMA store to complete.
+  tma_store_wait<0>();
+
   // Former code for writing out RMEM to GMEM directly
   // This reports as uncoalesced GMEM access by the profiler
   // Tensor tOgO = threadMma1.partition_C(gO);
@@ -341,6 +383,11 @@ fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
 // Write out rowMax and rowSum to GMEM.
 // Required for verification ONLY.
 #ifdef COPYOUTMI
+#ifdef CTA256
+  const int NumMmaWarpGroups = 2;
+#else
+  const int NumMmaWarpGroups = 1;
+#endif
   Tensor miGlobal = make_tensor(make_gmem_ptr(mi_ptr), gmemLayoutMi);
   Tensor miGlobalOut =
       local_tile(miGlobal, make_shape(get<0>(tileShapeQ), 1, 1),
@@ -357,7 +404,8 @@ fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
         cute::idx2crd(mmaThreadLayoutC(threadIdx.x, 0), mmaShapeMN);
     auto rowIdGlobal = get<0>(flatCoord); // starting rowId
     auto rowId = 0;
-    for (int i = rowIdGlobal; i < kQueriesPerBlock; i += 64) {
+    for (int i = rowIdGlobal; i < kQueriesPerBlock;
+         i += NumMmaWarpGroups * 64) {
       miGlobalOut(i) = rowMax(rowId);
       sPrimeGlobalOut(i) = rowSum(rowId);
       miGlobalOut(i + 8) = rowMax(rowId + 1);
@@ -367,6 +415,8 @@ fmhaForward(PrecType const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
   }
 #endif
 
+  cute::cluster_arrive_relaxed();
+  cute::cluster_wait();
   __syncthreads();
 }
 
@@ -397,6 +447,16 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   using MmaB = PrecType;
   using MmaC = AccumType;
 
+// Clusters perform poorly due to suboptimal synchronization logic
+// Will be reimplemented later
+#if defined(CLUSTERN) && CLUSTERN > 1
+#define TMA_LOAD SM90_TMA_LOAD_MULTICAST
+  using ClusterShape = Shape<Int<CLUSTERN>, _1, _1>;
+#else
+#define TMA_LOAD SM90_TMA_LOAD
+  using ClusterShape = Shape<_1, _1, _1>;
+#endif
+
   //
   // All the tensors are stored in BMHK order, with K being the unit-1
   // dimension. For now, n=m.
@@ -420,8 +480,8 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   Layout gmemLayoutK =
       make_layout(make_shape(N, K, H, B), make_stride(K * H, 1, K, H * N * K));
   Tensor gK = make_tensor(ptrK, gmemLayoutK);
-  auto tmak =
-      make_tma_copy(SM90_TMA_LOAD{}, gK, smemLayoutK, tileShapeK, Int<1>{});
+  auto tmak = make_tma_copy(TMA_LOAD{}, gK, smemLayoutK, tileShapeK,
+                            size<0>(ClusterShape{}));
 
   // Use only during debugging, direct writes to GMEM.
   auto tileShapeS = make_shape(bM{}, bN{});
@@ -437,8 +497,8 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   Layout gmemLayoutV =
       make_layout(make_shape(N, K, H, B), make_stride(K * H, 1, K, H * K * N));
   Tensor gV = make_tensor(ptrV, gmemLayoutV);
-  auto tmaV =
-      make_tma_copy(SM90_TMA_LOAD{}, gV, smemLayoutV, tileShapeV, Int<1>{});
+  auto tmaV = make_tma_copy(TMA_LOAD{}, gV, smemLayoutV, tileShapeV,
+                            size<0>(ClusterShape{}));
 
   // Layout for Vtranspose. For use in GEMM-II.
   auto tileShapeVt = make_shape(bK{}, bN{});
@@ -448,6 +508,9 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   auto tileShapeO = make_shape(bM{}, bK{});
   Layout gmemLayoutO =
       make_layout(make_shape(M, K, H, B), make_stride(K * H, 1, K, H * M * K));
+  Tensor gO = make_tensor(tensorO, gmemLayoutQ);
+  auto tmaO =
+      make_tma_copy(SM90_TMA_STORE{}, gO, smemLayoutQ, tileShapeO, Int<1>{});
 
 // Enable this flag for 256 threads (or 8 warps) per CTA.
 // Disabled by default.
@@ -488,7 +551,8 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
       decltype(smemLayoutK), decltype(tileShapeS), decltype(gmemLayoutS),
       decltype(smemLayoutS), decltype(tmaV), decltype(tileShapeV),
       decltype(gmemLayoutV), decltype(smemLayoutV), decltype(smemLayoutVt),
-      decltype(tileShapeO), decltype(gmemLayoutO), decltype(gmemLayoutMi)>;
+      decltype(tmaO), decltype(tileShapeO), decltype(gmemLayoutO),
+      decltype(gmemLayoutMi), ClusterShape>;
 
   // Compute and set dynamic shared memory size.
   auto smem_size = int(
@@ -511,7 +575,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   dim3 grid_dims(ceil_div(size(M), size(bM{})), H, B);
 
   // We do not use cluster feature yet. So, set it to 1.
-  dim3 cluster_dims(1, 1, 1);
+  dim3 cluster_dims(size<0>(ClusterShape{}), 1, 1);
 
   // Define the cluster launch parameter structure.
   cutlass::ClusterLaunchParams params{grid_dims, block_dims, cluster_dims,
@@ -526,7 +590,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
         params, kernel, ptrQ, tmaQ, tileShapeQ, gmemLayoutQ, smemLayoutQ, ptrK,
         tmak, tileShapeK, gmemLayoutK, smemLayoutK, tensorS, tileShapeS,
         gmemLayoutS, smemLayoutS, nTilesOfK, tensorV, tmaV, tileShapeV,
-        gmemLayoutV, smemLayoutV, smemLayoutVt, tensorO, tileShapeO,
+        gmemLayoutV, smemLayoutV, smemLayoutVt, tensorO, tmaO, tileShapeO,
         gmemLayoutO, miOut, sPrimeOut, gmemLayoutMi, scale);
   }
 }
