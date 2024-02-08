@@ -22,7 +22,6 @@ __device__ void gemm(TiledMma &tiled_mma, const Tensor<TA, LayoutA> &tCrA,
   warpgroup_commit_batch();
   warpgroup_wait<0>();
   warpgroup_fence_operand(tCrC);
-  __syncthreads(); // This is required for CTA 256.
 }
 
 template <typename TA, typename LayoutA, typename TB, typename LayoutB,

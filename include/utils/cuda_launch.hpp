@@ -12,7 +12,7 @@ void set_smem_size(int smem_size, void const* kernel)
           smem_size);
       if (cudaSuccess != result) {
         result = cudaGetLastError(); // to clear the error bit
-        std::cout << "  cudaFuncSetAttribute() returned error: " << cudaGetErrorString(result);
+        std::cout << "  Shared Memory Allocation Failed " << std:: endl << " cudaFuncSetAttribute() returned error: " << cudaGetErrorString(result) << std::endl;
       }
     }
 }
