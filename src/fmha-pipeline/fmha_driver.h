@@ -1,9 +1,41 @@
-#pragma once
+/***************************************************************************************************
+ * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ **************************************************************************************************/
 
 /*! \file
-    \brief Unit test for the PipelineTmaAsync class as it would be used in a
-   Warp specialized loop
+    \brief Driver for the pipelined FMHA kernel.
+    
+    Based on the CUTLASS unit test for the PipelineTmaAsync class.
 */
+
+#pragma once
 
 #define KERNEL_DBG_TRACE false
 
@@ -32,8 +64,8 @@ using namespace cute;
 using namespace cutlass;
 
 // Main FMHA Device Kernel.
-// Gemm1Type = Precision of Computation used by GEMM (half_t by default).
-// SoftType = Type of Accumulator used by GEMM (float by default).
+// GemmNType = Precision of Computation used by GEMM-N (half_t by default).
+// SoftType = Type of Accumulator used by GEMM-I and in softmax (float by default).
 // Other types are self-explanatory.
 template <class Gemm1Type, class AccumType, class SoftType, class Gemm2Type,
           class OutputType, class TiledMma0, class TiledMma1, class TiledCopyQ,
@@ -61,12 +93,13 @@ fmhaForward(Gemm1Type const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
             TileShapeO tileShapeO, GmemLayoutO gmemLayoutO,
             SmemLayoutO smemLayoutO, SoftType *mi_ptr, SoftType *sPrimePtr,
             GmemLayoutMI gmemLayoutMi, float scale)
-
 {
   extern __shared__ char shared_memory[];
+
   using MainloopPipeline =
       typename cutlass::PipelineTmaAsync<stageCount, ClusterShape>;
   using PipelineState = typename cutlass::PipelineState<stageCount>;
+  using BarrierType = typename MainloopPipeline::ProducerBarrierType;
 
   using SharedStorage =
       SharedStorage<Gemm1Type, Gemm2Type, OutputType, SmemLayoutQ, SmemLayoutK,
@@ -79,25 +112,29 @@ fmhaForward(Gemm1Type const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
   dim3 block_id_in_cluster = cute::block_id_in_cluster();
 
   auto cluster_shape = ClusterShape{};
-
-  // TODO: #Producers = #RowsInCluster + #ColsInCluster - 1
+  
+  // Unlike the unit test we always set this variable to 1
+  // independent of cluster size.
   uint32_t const NumProducers = 1;
 
   // Get the full un-partitioned tensors.
   // TMA tensors are special tensors.
   Tensor mQ = tmaLoadQ.get_tma_tensor(shape(gmemLayoutQ));
-  Tensor mK = tmaLoadK.get_tma_tensor(shape(gmemLayoutK));
-  Tensor mV = tmaLoadV.get_tma_tensor(shape(gmemLayoutV));
-  Tensor gK = local_tile(mK, tileShapeK, make_coord(0, 0, 0, 0));
-  Tensor gV = local_tile(mV, tileShapeV, make_coord(0, 0, 0, 0));
-  constexpr int per_cta_bytes = size(gK) * sizeof_bits_v<Gemm1Type> / 8 +
-                                size(gV) * sizeof_bits_v<Gemm2Type> / 8;
+  // The TMA load for K and V is now done in the producer method, so
+  // these tensors are unnecessary.
+  // Tensor mK = tmaLoadK.get_tma_tensor(shape(gmemLayoutK));
+  // Tensor mV = tmaLoadV.get_tma_tensor(shape(gmemLayoutV));  
+  // Tensor gK = local_tile(mK, tileShapeK, make_coord(0, 0, 0, 0));
+  // Tensor gV = local_tile(mV, tileShapeV, make_coord(0, 0, 0, 0));
+
+  // Compute TMA transaction bytes
+  constexpr int per_cta_bytes = size(tileShapeK) * sizeof_bits_v<Gemm1Type> / 8 +
+                                size(tileShapeV) * sizeof_bits_v<Gemm2Type> / 8;
   uint32_t const TmaTransactionBytes = per_cta_bytes * NumProducers;
 
   // Construct SMEM tensors.
   Tensor sQ =
       make_tensor(make_smem_ptr(shared_storage.qo.smem_q.data()), smemLayoutQ);
-  // Re-use sQ for sO too but with different layout (for fp8).
   Tensor sO =
       make_tensor(make_smem_ptr(shared_storage.qo.smem_o.data()), smemLayoutO);
   Tensor sK =
@@ -117,16 +154,11 @@ fmhaForward(Gemm1Type const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
   Tensor sVt =
       make_tensor(make_smem_ptr(shared_storage.kv.smem_v.data()), smemLayoutVt);
 
-  Tensor mO = make_tensor(make_gmem_ptr(O), gmemLayoutO);
 
   TiledMma0 tiledMma0;
   TiledMma1 tiledMma1;
   auto threadMma0 = tiledMma0.get_thread_slice(threadIdx.x);
   auto threadMma1 = tiledMma1.get_thread_slice(threadIdx.x);
-
-  //
-  // Partition the copying of dest tiles for Q, K and V among threads.
-  //
 
   // Allocate "fragments/descriptors"
   // for first matmul.
@@ -142,19 +174,21 @@ fmhaForward(Gemm1Type const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
   Tensor tOrS = threadMma1.partition_fragment_A(sS(_, _, 0));
   auto tOrPLayout = ReshapeTStoTP()(tSrS, tOrS);
 
-  // No pipeling for copying the block of Q.
-
-  // Get the block of Q for this CTA using the block coordinates
   // Get the block coordinates for this CTA.
   auto blockIdxX = uint64_t(blockIdx.x);
   auto blockIdxH = uint64_t(blockIdx.y);
   auto blockIdxB = uint64_t(blockIdx.z);
+
+  // No pipelining for copying the block of Q.
+
+  // Get the block of Q for this CTA using the block coordinates
   auto blkCoordQ = make_coord(blockIdxX, 0, blockIdxH, blockIdxB);
   Tensor gQ = local_tile(mQ, tileShapeQ, blkCoordQ);
 
   // Partition the copying of source tiles for Q among threads.
   auto cta_tmaQ = tmaLoadQ.get_slice(0);
   Tensor tQgQX = cta_tmaQ.partition_S(gQ);
+
   // Group the REST_X modes and the TMA_X modes to easily iterate through the
   // tiles
   Tensor tQgQ = group_modes<1, rank(tQgQX)>(tQgQX); // (TMA,REST)
@@ -162,11 +196,10 @@ fmhaForward(Gemm1Type const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
   assert(kTiles == 1);
   assert(kTiles == size<2>(gQ));
 
-  //
-  // Partition the copying of dest tiles for Q, K and V among threads.
-  //
+  // Partition the copying of dest tile for Q among threads.  
   Tensor tQsQX = cta_tmaQ.partition_D(sQ);
   Tensor tQsQ = group_modes<1, rank(tQsQX)>(tQsQX);
+
   // Copy Q tile from GMEM to SMEM.
   uint64_t *tma_load_mbar = shared_storage.tma_load_mbar;
   cfk::barrierInit(tma_load_mbar[0], 1);
@@ -181,15 +214,14 @@ fmhaForward(Gemm1Type const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
   // FMHA OUTPUT (GEMM-II) accumulator.
   Tensor tOrO = partition_fragment_C(tiledMma1, tileShapeO);
   clear(tOrO);
+
   // Allocate space for per-thread rowMax and rowSum in rmem.
   Tensor rowMax = make_tensor<SoftType>(Shape<Int<2 * size<1>(tSrS)>>{});
   Tensor rowSum = make_fragment_like(rowMax);
   cute::fill(rowMax, -cutlass::platform::numeric_limits<SoftType>::infinity());
   cute::fill(rowSum, SoftType(0.0));
-  // ------------ Pipelining begins -------------------------------
 
-  // if (cute::thread0())
-  //  print("yes\n");
+  // ------------ Pipelining begins -------------------------------
 
   // mbarrier.init
   typename MainloopPipeline::Params params;
@@ -221,17 +253,17 @@ fmhaForward(Gemm1Type const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
   PipelineState smem_pipe_write =
       cutlass::make_producer_start_state<MainloopPipeline>();
   PipelineState smem_pipe_release;
+  
   int K_TILE_MMAS = 1;
-
   int k_pipe_tma_prologue = min(stageCount, tma_k_iterations);
 
   int lane_predicate = cute::elect_one_sync();
   if (warp_idx == 0 && lane_predicate) {
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < k_pipe_tma_prologue; ++i) {
-      pipeline.producer_acquire(smem_pipe_write);
-      using BarrierType = typename MainloopPipeline::ProducerBarrierType;
-      BarrierType *tmaBar = pipeline.producer_get_barrier(smem_pipe_write);
+      pipeline.producer_acquire(smem_pipe_write);      
+      BarrierType *tmaBar = pipeline.producer_get_barrier(smem_pipe_write);      
+      
       fmhaForwardProducer(sK(_, _, i), tmaLoadK, tileShapeK, gmemLayoutK,
                           sV(_, _, i), tmaLoadV, tileShapeV, gmemLayoutV,
                           blockIdxYProd++, tmaBar, ClusterShape());
@@ -250,7 +282,6 @@ fmhaForward(Gemm1Type const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
                         tOrV(_, _, _, stage), tOrO, tOrPLayout, rowMax, rowSum,
                         tileShapeS, gmemLayoutS, scale, blockIdxYCons++,
                         tiledMma0, tiledMma1, AccumType(0), SoftType(0));
-
     ++smem_pipe_read;
   }
 
@@ -259,9 +290,7 @@ fmhaForward(Gemm1Type const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
   CUTLASS_PRAGMA_NO_UNROLL
   for (int iter = 0; iter < mma_k_iterations; ++iter) {
     pipeline.consumer_wait(smem_pipe_read);
-
-    warpgroup_arrive();
-    // GMMA would typically happen here
+    warpgroup_arrive();  
     int stage = smem_pipe_read.index();
 
     fmhaForwardConsumer(Q, K, V, S, tSrQ, tSrK(_, _, _, stage), tSrS,
@@ -272,19 +301,16 @@ fmhaForward(Gemm1Type const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
     pipeline.consumer_release(smem_pipe_release);
 
     if (lane_predicate && (warp_idx == 0) && (tma_k_iterations > 0)) {
-      pipeline.producer_acquire(smem_pipe_write);
-      // cp.async.bulk.tensor would typically happen here
-      using BarrierType = typename MainloopPipeline::ProducerBarrierType;
+      pipeline.producer_acquire(smem_pipe_write);         
       BarrierType *tmaBar = pipeline.producer_get_barrier(smem_pipe_write);
       auto stage = smem_pipe_write.index();
+
       fmhaForwardProducer(sK(_, _, stage), tmaLoadK, tileShapeK, gmemLayoutK,
                           sV(_, _, stage), tmaLoadV, tileShapeV, gmemLayoutV,
                           blockIdxYProd++, tmaBar, ClusterShape());
-
       ++smem_pipe_write;
       --tma_k_iterations;
     }
-
     // next read stage
     ++smem_pipe_read;
     ++smem_pipe_release;
@@ -296,7 +322,7 @@ fmhaForward(Gemm1Type const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
   fmhaForwardWriteOutTMA(tOrO, rowMax, rowSum, O, tileShapeO, gmemLayoutO,
                          mi_ptr, sPrimePtr, gmemLayoutMi, tiledMma0, tiledMma1,
                          sO, tmaStoreO, leaderWarp);
-  // To make sure remote SMEM doesn't get destoryed
+  // To make sure remote SMEM doesn't get destroyed
   cute::cluster_arrive();
   cute::cluster_wait();
 }

@@ -17,10 +17,7 @@ inline __device__ auto convert_type(Fragment const &tensor) {
   return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
 }
 
-// Main FMHA Device Kernel.
-// Gemm1Type = Precision of Computation used by GEMM (half_t by default).
-// SoftType = Type of Accumulator used by GEMM (float by default).
-// Other types are self-explanatory.
+// FMHA Consumer does GEMMs and softmax
 template <class Gemm1Type, class AccumType, class SoftType, class Gemm2Type,
           class TiledMma0, class TiledMma1, class TileShapeS, class GmemLayoutS,
           typename TensorQ, typename TensorK, typename TensorS,
@@ -78,10 +75,8 @@ fmhaForwardConsumer(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V,
 #endif
 }
 
-// Main FMHA Device Kernel.
-// Gemm1Type = Precision of Computation used by GEMM (half_t by default).
-// SoftType = Type of Accumulator used by GEMM (float by default).
-// Other types are self-explanatory.
+// Epilogue that copies RMEM -> GMEM directly
+// Reports as uncoalesced stores by the profiler
 template <class TensorO, class RowMax, class RowSum, class SoftType,
           class OutputType, class TiledMma0, class TiledMma1, class TileShapeO,
           class GmemLayoutO, class GmemLayoutMI>
@@ -96,15 +91,15 @@ fmhaForwardWriteOut(TensorO &tOrO, const RowMax &rowMax, const RowSum &rowSum,
   auto blockIdxX = uint64_t(blockIdx.x);
   auto blockIdxH = uint64_t(blockIdx.y);
   auto blockIdxB = uint64_t(blockIdx.z);
-  Tensor mO = make_tensor(make_gmem_ptr(O), gmemLayoutO);
-  // Copy output Tile from RMEM to GMEM directly.
+
+  // Apply softmax normalization before writing out to GMEM.
+  applySoftmaxNormalizer<SoftType>(rowSum, tOrO);
+
+  Tensor mO = make_tensor(make_gmem_ptr(O), gmemLayoutO); 
   auto blkCoordO = make_coord(blockIdxX, 0, blockIdxH, blockIdxB);
   Tensor gO = local_tile(mO, tileShapeO, blkCoordO);
   auto threadMma1 = tiledMma1.get_thread_slice(threadIdx.x);
   Tensor tOgO = threadMma1.partition_C(gO);
-
-  // Apply softmax normalization before writing out to GMEM.
-  applySoftmaxNormalizer<SoftType>(rowSum, tOrO);
 
   // Write out to GMEM.
   copy(tOrO, tOgO);
@@ -140,10 +135,7 @@ fmhaForwardWriteOut(TensorO &tOrO, const RowMax &rowMax, const RowSum &rowSum,
 #endif
 }
 
-// Main FMHA Device Kernel.
-// Gemm1Type = Precision of Computation used by GEMM (half_t by default).
-// SoftType = Type of Accumulator used by GEMM (float by default).
-// Other types are self-explanatory.
+// Epilogue with SMEM pass-through
 template <class TensorO, class RowMax, class RowSum, class SoftType,
           class OutputType, class TiledMma0, class TiledMma1, class TileShapeO,
           class GmemLayoutO, class GmemLayoutMI, class TensorSO,
@@ -159,22 +151,24 @@ fmhaForwardWriteOutCoalesced(
   auto blockIdxX = uint64_t(blockIdx.x);
   auto blockIdxH = uint64_t(blockIdx.y);
   auto blockIdxB = uint64_t(blockIdx.z);
-  Tensor mO = make_tensor(make_gmem_ptr(O), gmemLayoutO);
-  // Copy output Tile from RMEM to GMEM directly.
-  auto blkCoordO = make_coord(blockIdxX, 0, blockIdxH, blockIdxB);
-  Tensor gO = local_tile(mO, tileShapeO, blkCoordO);
-  auto threadMma1 = tiledMma1.get_thread_slice(threadIdx.x);
 
   // Apply softmax normalization before writing out to GMEM.
   applySoftmaxNormalizer<SoftType>(rowSum, tOrO);
 
+  auto threadMma1 = tiledMma1.get_thread_slice(threadIdx.x);
   Tensor tOsOAcc = threadMma1.partition_C(sO);
   cfk::copy(tOrO, tOsOAcc);
+
+  Tensor mO = make_tensor(make_gmem_ptr(O), gmemLayoutO);  
+  auto blkCoordO = make_coord(blockIdxX, 0, blockIdxH, blockIdxB);
+  Tensor gO = local_tile(mO, tileShapeO, blkCoordO);
 
   auto tOgO =
       local_partition(gO, tO, threadIdx.x, Step<_1, _1>{}); // (THR_M,THR_N)
   auto tOsO =
       local_partition(sO, tO, threadIdx.x, Step<_1, _1>{}); // (THR_M,THR_N)
+  
+  // Write out to GMEM.
   copy(tOsO, tOgO);
 
 // Write out rowMax and rowSum to GMEM.
@@ -208,10 +202,7 @@ fmhaForwardWriteOutCoalesced(
 #endif
 }
 
-// Main FMHA Device Kernel.
-// Gemm1Type = Precision of Computation used by GEMM (half_t by default).
-// SoftType = Type of Accumulator used by GEMM (float by default).
-// Other types are self-explanatory.
+// Epilogue with TMA Store
 template <class TensorO, class RowMax, class RowSum, class SoftType,
           class OutputType, class TiledMma0, class TiledMma1, class TileShapeO,
           class GmemLayoutO, class GmemLayoutMI, class TensorSO,
@@ -229,40 +220,35 @@ fmhaForwardWriteOutTMA(TensorO &tOrO, const RowMax &rowMax,
   auto blockIdxX = uint64_t(blockIdx.x);
   auto blockIdxH = uint64_t(blockIdx.y);
   auto blockIdxB = uint64_t(blockIdx.z);
-  Tensor mO = tmaStoreO.get_tma_tensor(shape(gmemLayoutO));
-  // Copy output Tile from RMEM to GMEM directly.
-  auto threadMma1 = tiledMma1.get_thread_slice(threadIdx.x);
 
   // Apply softmax normalization before writing out to GMEM.
   applySoftmaxNormalizer<SoftType>(rowSum, tOrO);
 
+  auto threadMma1 = tiledMma1.get_thread_slice(threadIdx.x);
   Tensor tOsOAcc = threadMma1.partition_C(sO);
   cfk::copy(tOrO, tOsOAcc);
-
-  // Do TMA store to GMEM
+  
+  Tensor mO = tmaStoreO.get_tma_tensor(shape(gmemLayoutO));
   auto blkCoordO = make_coord(blockIdxX, 0, blockIdxH, blockIdxB);
   Tensor gO = local_tile(mO, tileShapeO, blkCoordO);
-
-  // Partition the copying of source tiles for O among threads.
+  
   auto cta_tmaO = tmaStoreO.get_slice(0);
-  Tensor tOgOX = cta_tmaO.partition_D(gO);
-  // Group the REST_X modes and the TMA_X modes to easily iterate through the
-  // tiles
+  
+  Tensor tOgOX = cta_tmaO.partition_D(gO);  
   Tensor tOgO = group_modes<1, rank(tOgOX)>(tOgOX); // (TMA,REST)
   assert(size<1>(tOgO) == 1);
 
-  //
-  // Partition the copying of src tiles for O
-  //
   Tensor tOsOX = cta_tmaO.partition_S(sO);
   Tensor tOsO = group_modes<1, rank(tOsOX)>(tOsOX); // (TMA,REST)
   static_assert(size<1>(tOsO) == 1);
 
   int lane_predicate = cute::elect_one_sync();
+  // Issue the TMA store.
   if (leaderWarp and lane_predicate) {
     cute::copy(tmaStoreO, tOsO, tOgO);
   }
-
+  
+  // Wait for TMA store to complete.
   tma_store_wait<0>();
 
 // Write out rowMax and rowSum to GMEM.

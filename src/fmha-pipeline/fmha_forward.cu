@@ -53,6 +53,7 @@
 #include "fmha_driver_ws.h"
 #include "ss_helper.h"
 
+//Helper functions for retrieving optimal swizzled layouts
 template <typename PrecType, int DIM> constexpr auto getSmemLayoutK() {
 
   constexpr int headSizeBytes = sizeof(PrecType) * DIM;
@@ -170,6 +171,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
       smemLayoutAtomS,
       make_shape(shape<0>(tileShapeS), shape<1>(tileShapeS), STAGES()));
 
+// We assume V is NOT transposed in memory by default.
 #ifndef VTRANS
   auto tileShapeV = make_shape(bN{}, bK{});
   auto smemLayoutAtomV =
@@ -185,6 +187,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
                             size<0>(ClusterShape{}));
 
   // Layout for Vtranspose. For use in GEMM-II.
+  // Note this is the transpose in terms of the view, not in terms of memory.
   auto tileShapeVt = make_shape(bK{}, bN{});
   auto smemLayoutVtFp16 = composition(
       smemLayoutV, make_layout(make_shape(shape<0>(tileShapeVt),
@@ -199,7 +202,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
       cute::conditional_return<is_same_v<Mma2B, cutlass::half_t>>(
           smemLayoutVtFp16, smemLayoutVtFp8);
 
-  // The following is Only for FP8 (and may be for TF32 in future).
+  // The following is only for FP8 (and may be for TF32 in future).
   auto srcSmemLayoutAtomV = GMMA::Layout_MN_SW64_Atom<Mma2B>{};
   auto srcSmemLayoutV = smemLayoutVtFp16;
 
@@ -237,7 +240,6 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
       make_tma_copy(SM90_TMA_STORE{}, gO, smemLayoutO, tileShapeO, Int<1>{});
 
 // Enable this flag for 256 threads (or 8 warps) per CTA.
-// Disabled by default.
 #ifdef CTA256
   using MmaTileShape = Layout<Shape<_2, _1, _1>>;
 #else
@@ -245,8 +247,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
 #endif
 
 #ifdef QINRMEM
-  // USE RS version of GMMA for GEMM-I.
-  // NOTE: RS version has a synchronization bug for FP16 and hence not used.
+  // USE RS version of GMMA for GEMM-I.  
   using TiledMma0 = decltype(cute::make_tiled_mma(
       rs_op_selector_custom<MmaA, MmaB, MmaC, Shape<bM, bN, bK>>(),
       MmaTileShape{}));
@@ -265,6 +266,10 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
       MmaTileShape{}));
 #else
   // USE RS version of GMMA for GEMM-II (Default).
+  // If V is not assumed transposed in memory, then our choice of majorV changes
+  // based on the precision type of V being FP16 or FP8 (-> MN major or K major).
+  // This is because transposing the 2nd operand with WGMMA is currently supported
+  // for FP16 only. Thus for V FP8, we need to do the transpose ourselves.
   using TiledMma1 = decltype(cute::make_tiled_mma(
       rs_op_selector_custom<Mma2A, Mma2B, Mma2C, Shape<bM, bK, bN>,
                             GMMA::Major::K, majorV>(),
@@ -274,6 +279,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   // col-major for MI and S_prime (used only for verification).
   Layout gmemLayoutMi = make_layout(make_shape(M, H, B), GenColMajor{});
 
+// We separate out the warp-specialized kernel using a compiler flag
 #ifdef WSPL
   // Get the ptr to kernel function.
   void const *kernel = (void const *)fmhaForwardWS<
@@ -306,6 +312,10 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   auto ctaSize = size(TiledMma0{});
 #endif
 
+  //
+  // Define CUDA launch kernel parameters.
+  //
+
   // Compute and set dynamic shared memory size.
   auto smem_size =
       int(sizeof(SharedStorage<MmaA, Mma2A, OutputType, decltype(smemLayoutQ),
@@ -314,12 +324,9 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
                                ClusterShape>));
   cfk::utils::set_smem_size(smem_size, kernel);
 
-  //
-  // Define CUDA launch kernel parameters.
-  //
-
   // Set the THREAD BLOCK (CTA) dimensions.
   // #threads in CTA = #threads in MMA (128 by default) + 128 (for WS).
+  // For example, this is 3*128 (= 3 warpgroups) for CTA256 and WS.
   dim3 block_dims(ctaSize);
 
   // Set the GRID dimensions (3-D).
@@ -328,7 +335,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   // Third dimension = # of batches.
   dim3 grid_dims(ceil_div(size(M), size(bM{})), H, B);
 
-  // We do not use cluster feature yet. So, set it to 1.
+  // Set the CLUSTER dimensions.
   dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}),
                     size<2>(ClusterShape{}));
 
@@ -450,7 +457,7 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
   cutlass::Distribution::Kind initQ;
   cutlass::Distribution::Kind initK;
   cutlass::Distribution::Kind initV;
-  if (refCheck) {
+  if (refCheck) {    
     initQ = cutlass::Distribution::Uniform;
     initK = cutlass::Distribution::Uniform;
     initV = cutlass::Distribution::Uniform;
@@ -474,6 +481,8 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
   thrust::host_vector<Gemm2Type> hostV = devV;
   thrust::host_vector<OutputType> hostD = devD;
 
+// For our experiments with V transposed in memory,
+// we view the cost of the transpose as offline.
 #ifdef VTRANS
   thrust::host_vector<Gemm2Type> hostVt = hostV;
 
@@ -594,9 +603,12 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
                     sPrimeRefHostOut.data(), usePow2, usePreScaling);
     thrust::host_vector<TestPrecType> cublas_result_S = devSFloat;
     thrust::host_vector<TestPrecType> cublas_result_D = devDFloat;
-
+    
+    // For lower precision formats, we want to distinguish between validation
+    // errors due to bugs vs. expected errors from low precision computation.
+    // In practice, percentage of errors should be far lower than this.
     auto errCountExpected =
-        typeid(PrecType) == typeid(cutlass::float_e4m3_t) ? 1.0 : 0.0;
+        typeid(PrecType) == typeid(cutlass::float_e4m3_t) ? 0.001 : 0.0001;
 #ifdef COPYOUTMM0
     // Our intermediate write to S is unscaled. So scale it before checking
     // with CUTLASS.
@@ -651,6 +663,7 @@ void print_usage() {
       << "Options:\n\n"
       << "  --help                      If specified, displays this usage "
          "statement.\n\n"
+      << "  --prec-type=<int>           1 (default) for FP16, 2 for FP8.\n"         
       << "  --batch-size=<int>          Batch size in multi-head attention "
          "(default: --batch_size=16).\n"
       << "  --dim-size=<int>            Full Size of the head dimension "
@@ -697,7 +710,8 @@ int main(int argc, char const **argv) {
   int numHeads = dimSize / kHeadSize;
 
   // Instantiate the function template for different HEADDIMS.
-  // For now, only half_t is supported. TF32 is WIP.
+  // For now, only half_t and e4m3_t are supported.
+  // Though it's simple to also add e5m2_t.
   if (precType == 1) {
     if (kHeadSize == 64) {
       testFmhaForward<cutlass::half_t, 64>(seqLength, seqLength, numHeads,
@@ -715,7 +729,10 @@ int main(int argc, char const **argv) {
       std::cout << "Unsupported head dim: " << kHeadSize << std::endl;
       exit(-1);
     }
-  } else if (precType == 2) {
+  }
+  //For FP8, we choose e4m3 according to the following philosophy:
+  //e4m3 for inference (forward pass), e5m2 for training (backward pass).
+  else if (precType == 2) {
 #if 1
     if (kHeadSize == 64) {
 #if defined(VTRANS) || defined(GEMM2FP16) || (KBLKSIZE == 64)

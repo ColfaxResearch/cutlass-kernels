@@ -59,7 +59,7 @@ bool verify_tensor(thrust::host_vector<Element> vector_Input,
                      : vector_Input_Ref.size();
   size = (verify_length == -1) ? size : verify_length;
 
-  // 0.05 for absolute error
+  // 0.005 for absolute error
   float abs_tol = 5e-3f;
   // 10% for relative error
   float rel_tol = 1e-1f;

@@ -1,8 +1,6 @@
 #pragma once
-// Main FMHA Device Kernel.
-// Gemm1Type = Precision of Computation used by GEMM (half_t by default).
-// SoftType = Type of Accumulator used by GEMM (float by default).
-// Other types are self-explanatory.
+
+// FMHA Producer does K and V copy
 template <class TensorEngineK, class SmemLayoutK, class TiledCopyK,
           class TileShapeK, class GmemLayoutK, class TensorEngineV,
           class SmemLayoutV, class TiledCopyV, class TileShapeV,
@@ -22,7 +20,7 @@ fmhaForwardProducer(Tensor<TensorEngineK, SmemLayoutK> &&sK,
   auto blockIdxB = uint64_t(blockIdx.z);
 
   // Get the full un-partitioned tensors.
-  // TMA tensors are special tensors.
+  // TMA tensors are special tensors.  
   Tensor mK = tmaLoadK.get_tma_tensor(shape(gmemLayoutK));
   Tensor mV = tmaLoadV.get_tma_tensor(shape(gmemLayoutV));
 
@@ -42,9 +40,11 @@ fmhaForwardProducer(Tensor<TensorEngineK, SmemLayoutK> &&sK,
   Tensor tVsV = group_modes<1, rank(tVsVX)>(tVsVX);
   static_assert(size<1>(tVsV) == 1);
   static_assert(size<1>(tKsK) == 1);
-
+  
+  //
+  // Get the GMEM tensors for K and V
+  //
   auto blkCoordK = make_coord(blockIdxY, 0, blockIdxH, blockIdxB);
-
   Tensor gK = local_tile(mK, tileShapeK, blkCoordK);
 
   Tensor tKgKX = blockTmaK.partition_S(gK);
@@ -62,8 +62,7 @@ fmhaForwardProducer(Tensor<TensorEngineK, SmemLayoutK> &&sK,
   Tensor gV = local_tile(mV, tileShapeV, blkCoordV);
 
   Tensor tVgVX = blockTmaV.partition_S(gV);
-
-  Tensor tVgV = group_modes<1, rank(tVgVX)>(tVgVX);
+  Tensor tVgV = group_modes<1, rank(tVgVX)>(tVgVX); // (TMA,REST)
   assert(size<1>(tVgV) == size<2>(gV));
   assert(size<1>(tVgV) == 1);
 
@@ -73,7 +72,8 @@ fmhaForwardProducer(Tensor<TensorEngineK, SmemLayoutK> &&sK,
     mcast_mask_a |= (uint16_t(1) << block_layout(n, 0, Int<0>{}));
   }
 
-  // Copy current tile of V and K from GMEM to SMEM.
+  // Copy current tiles of V and K from GMEM to SMEM.
+  // Uses TMA multicast for CLUSTERN>1
   copy(tmaLoadK.with(*tmaBar, mcast_mask_a), tKgK(_, 0), tKsK(_, 0));
   copy(tmaLoadV.with(*tmaBar, mcast_mask_a), tVgV(_, 0), tVsV(_, 0));
 }
