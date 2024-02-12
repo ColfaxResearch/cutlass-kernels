@@ -62,7 +62,7 @@ struct SharedStorage {
   };
   struct {
     cute::uint64_t tma_load_mbar[1];
-    typename cutlass::PipelineTmaAsync<stageCount, ClusterShape>::SharedStorage
+    typename cutlass::PipelineTmaAsync<stageCount>::SharedStorage
         storage;
   };
 };
@@ -79,7 +79,7 @@ struct SharedStorage {
   };
   struct {
     cute::uint64_t tma_load_mbar[1];
-    typename cutlass::PipelineTmaAsync<stageCount, ClusterShape>::SharedStorage
+    typename cutlass::PipelineTmaAsync<stageCount>::SharedStorage
         storage;
   };
 };

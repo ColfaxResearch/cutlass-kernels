@@ -93,8 +93,10 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
 
 {
   extern __shared__ char shared_memory[];
-  using MainloopPipeline =
-      typename cutlass::PipelineTmaAsync<stageCount, ClusterShape>;
+  using MainloopPipeline = typename cutlass::PipelineTmaAsync<stageCount>;
+  // Change to this to use with CUTLASS 3.3 Pipeline API
+  // using MainloopPipeline =
+  //     typename cutlass::PipelineTmaAsync<stageCount, ClusterShape>;
   using PipelineState = typename cutlass::PipelineState<stageCount>;
   using BarrierType = typename MainloopPipeline::ProducerBarrierType;
 
@@ -226,8 +228,11 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
   }
   params.is_leader = warp_group_thread_idx == 0;
   params.num_consumers = NumMmaThreads;
+   
   
-  MainloopPipeline pipeline(shared_storage.storage, params);
+  MainloopPipeline pipeline(shared_storage.storage, params, cluster_shape);
+  // Change to this to use with CUTLASS 3.3 Pipeline API
+  // MainloopPipeline pipeline(shared_storage.storage, params);
 
   int blockIdxY = 0;
 

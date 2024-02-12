@@ -96,8 +96,10 @@ fmhaForward(Gemm1Type const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
 {
   extern __shared__ char shared_memory[];
 
-  using MainloopPipeline =
-      typename cutlass::PipelineTmaAsync<stageCount, ClusterShape>;
+  using MainloopPipeline = typename cutlass::PipelineTmaAsync<stageCount>;
+  // Change to this to use with CUTLASS 3.3 Pipeline API
+  // using MainloopPipeline =
+  //     typename cutlass::PipelineTmaAsync<stageCount, ClusterShape>;
   using PipelineState = typename cutlass::PipelineState<stageCount>;
   using BarrierType = typename MainloopPipeline::ProducerBarrierType;
 
@@ -224,7 +226,9 @@ fmhaForward(Gemm1Type const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
 
   params.num_consumers = NumMmaThreads;
 
-  MainloopPipeline pipeline(shared_storage.storage, params);
+  MainloopPipeline pipeline(shared_storage.storage, params, cluster_shape);
+  // Change to this to use with CUTLASS 3.3 Pipeline API
+  // MainloopPipeline pipeline(shared_storage.storage, params);
 
   int blockIdxYProd = 0;
   int blockIdxYCons = 0;

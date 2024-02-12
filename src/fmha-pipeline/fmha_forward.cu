@@ -150,8 +150,8 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
       make_tma_copy(SM90_TMA_LOAD{}, gQ, smemLayoutQ, tileShapeQ, Int<1>{});
 
   auto tileShapeK = make_shape(bN{}, bK{});
-  auto smemLayoutK = tile_to_shape(
-      getSmemLayoutK<MmaB, HEADDIM>(),
+  // For pipelined FMHA, the third dimension for SMEM K is the number of stages.
+  auto smemLayoutK = tile_to_shape(getSmemLayoutK<MmaB, HEADDIM>(),
       make_shape(shape<0>(tileShapeK), shape<1>(tileShapeK), STAGES()));
   Layout gmemLayoutK =
       make_layout(make_shape(N, K, H, B), make_stride(K * H, 1, K, H * N * K));
@@ -167,18 +167,19 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   auto smemLayoutAtomS =
       cute::conditional_return<is_same_v<MmaA, cutlass::half_t>>(
           getSmemLayoutK<MmaA, HEADDIM>(), GMMA::Layout_K_SW64_Atom<MmaA>{});
-  auto smemLayoutS = tile_to_shape(
-      smemLayoutAtomS,
+  auto smemLayoutS = tile_to_shape(smemLayoutAtomS,
       make_shape(shape<0>(tileShapeS), shape<1>(tileShapeS), STAGES()));
 
 // We assume V is NOT transposed in memory by default.
+// Currently, we only support V FP16, so only one branch in this code is taken.
+// We have left the other branch in with a view to future work with V FP8.
 #ifndef VTRANS
   auto tileShapeV = make_shape(bN{}, bK{});
   auto smemLayoutAtomV =
       cute::conditional_return<is_same_v<Mma2B, cutlass::half_t>>(
           getSmemLayoutK<Mma2B, HEADDIM>(), GMMA::Layout_K_SW64_Atom<Mma2B>{});
-  auto smemLayoutV = tile_to_shape(
-      smemLayoutAtomV,
+  // For pipelined FMHA, the third dimension for SMEM V is the number of stages.
+  auto smemLayoutV = tile_to_shape(smemLayoutAtomV,
       make_shape(shape<0>(tileShapeV), shape<1>(tileShapeV), STAGES()));
   Layout gmemLayoutV =
       make_layout(make_shape(N, K, H, B), make_stride(K * H, 1, K, H * K * N));
@@ -202,10 +203,14 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
       cute::conditional_return<is_same_v<Mma2B, cutlass::half_t>>(
           smemLayoutVtFp16, smemLayoutVtFp8);
 
-  // The following is only for FP8 (and may be for TF32 in future).
+  // The following is only for V FP8 (and may be for TF32 in future).  
   auto srcSmemLayoutAtomV = GMMA::Layout_MN_SW64_Atom<Mma2B>{};
   auto srcSmemLayoutV = smemLayoutVtFp16;
-
+  
+  // If V is not assumed transposed in memory, then our choice of majorV changes
+  // based on the precision type of V being FP16 or FP8 (-> MN major or K major).
+  // This is because transposing the 2nd operand with WGMMA is currently supported
+  // for FP16 only. Thus for V FP8, we would need to do the transpose ourselves.
   constexpr auto majorV =
       cute::conditional_return<is_same_v<Mma2B, cutlass::half_t>>(
           GMMA::Major::MN, GMMA::Major::K);
@@ -266,10 +271,6 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
       MmaTileShape{}));
 #else
   // USE RS version of GMMA for GEMM-II (Default).
-  // If V is not assumed transposed in memory, then our choice of majorV changes
-  // based on the precision type of V being FP16 or FP8 (-> MN major or K major).
-  // This is because transposing the 2nd operand with WGMMA is currently supported
-  // for FP16 only. Thus for V FP8, we would need to do the transpose ourselves.
   using TiledMma1 = decltype(cute::make_tiled_mma(
       rs_op_selector_custom<Mma2A, Mma2B, Mma2C, Shape<bM, bK, bN>,
                             GMMA::Major::K, majorV>(),
@@ -733,11 +734,12 @@ int main(int argc, char const **argv) {
       exit(-1);
     }
   }
-  //For FP8, we choose e4m3 according to the following philosophy:
-  //e4m3 for inference (forward pass), e5m2 for training (backward pass).
+// For FP8, we choose e4m3 according to the following philosophy:
+// e4m3 for inference (forward pass), e5m2 for training (backward pass).
   else if (precType == 2) {
 #if 1
     if (kHeadSize == 64) {
+// We disable GEMM2FP16 for now (always set to true)
 // #if defined(VTRANS) || defined(GEMM2FP16) || (KBLKSIZE == 64)
       testFmhaForward<cutlass::float_e4m3_t, 64>(
           seqLength, seqLength, numHeads, batchSize, iterations, refCheck,
