@@ -665,7 +665,8 @@ void print_usage() {
       << "Options:\n\n"
       << "  --help                      If specified, displays this usage "
          "statement.\n\n"
-      << "  --prec-type=<int>           1 (default) for FP16, 2 for FP8.\n"         
+      << "  --prec-type=<int>           1 (default) for FP16, 2 for FP8 hybrid "
+         "(Q and K are FP8 E4M3, V is FP16).\n"
       << "  --batch-size=<int>          Batch size in multi-head attention "
          "(default: --batch_size=16).\n"
       << "  --dim-size=<int>            Full Size of the head dimension "
@@ -737,7 +738,7 @@ int main(int argc, char const **argv) {
   else if (precType == 2) {
 #if 1
     if (kHeadSize == 64) {
-#if defined(VTRANS) || defined(GEMM2FP16) || (KBLKSIZE == 64)
+// #if defined(VTRANS) || defined(GEMM2FP16) || (KBLKSIZE == 64)
       testFmhaForward<cutlass::float_e4m3_t, 64>(
           seqLength, seqLength, numHeads, batchSize, iterations, refCheck,
           printValues, printDiffs, nStreams);
