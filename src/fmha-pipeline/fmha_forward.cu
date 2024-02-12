@@ -742,7 +742,7 @@ int main(int argc, char const **argv) {
       testFmhaForward<cutlass::float_e4m3_t, 64>(
           seqLength, seqLength, numHeads, batchSize, iterations, refCheck,
           printValues, printDiffs, nStreams);
-#endif
+// #endif
     } else if (kHeadSize == 128) {
       testFmhaForward<cutlass::float_e4m3_t, 128>(
           seqLength, seqLength, numHeads, batchSize, iterations, refCheck,
