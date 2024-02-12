@@ -117,15 +117,8 @@ fmhaForward(Gemm1Type const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
   // independent of cluster size.
   uint32_t const NumProducers = 1;
 
-  // Get the full un-partitioned tensors.
-  // TMA tensors are special tensors.
-  Tensor mQ = tmaLoadQ.get_tma_tensor(shape(gmemLayoutQ));
-  // The TMA load for K and V is now done in the producer method, so
-  // these tensors are unnecessary.
-  // Tensor mK = tmaLoadK.get_tma_tensor(shape(gmemLayoutK));
-  // Tensor mV = tmaLoadV.get_tma_tensor(shape(gmemLayoutV));  
-  // Tensor gK = local_tile(mK, tileShapeK, make_coord(0, 0, 0, 0));
-  // Tensor gV = local_tile(mV, tileShapeV, make_coord(0, 0, 0, 0));
+  // Get only TMA tensor mQ outside of producer loops.
+  Tensor mQ = tmaLoadQ.get_tma_tensor(shape(gmemLayoutQ));  
 
   // Compute TMA transaction bytes
   constexpr int per_cta_bytes = size(tileShapeK) * sizeof_bits_v<Gemm1Type> / 8 +
@@ -153,26 +146,6 @@ fmhaForward(Gemm1Type const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
   // Tensor for V Transpose; used in GEMM-II.
   Tensor sVt =
       make_tensor(make_smem_ptr(shared_storage.kv.smem_v.data()), smemLayoutVt);
-
-
-  TiledMma0 tiledMma0;
-  TiledMma1 tiledMma1;
-  auto threadMma0 = tiledMma0.get_thread_slice(threadIdx.x);
-  auto threadMma1 = tiledMma1.get_thread_slice(threadIdx.x);
-
-  // Allocate "fragments/descriptors"
-  // for first matmul.
-  Tensor tSrQ = threadMma0.partition_fragment_A(sQ);
-  Tensor tSrK = threadMma0.partition_fragment_B(sK);
-  Tensor tSrS = partition_fragment_C(tiledMma0, tileShapeS);
-  clear(tSrS);
-
-  // Allocate "fragments/descriptors"
-  // for second matmul.
-  // Note: S becomes P.
-  Tensor tOrV = threadMma1.partition_fragment_B(sVt);
-  Tensor tOrS = threadMma1.partition_fragment_A(sS(_, _, 0));
-  auto tOrPLayout = ReshapeTStoTP()(tSrS, tOrS);
 
   // Get the block coordinates for this CTA.
   auto blockIdxX = uint64_t(blockIdx.x);
@@ -205,6 +178,26 @@ fmhaForward(Gemm1Type const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
   cfk::barrierInit(tma_load_mbar[0], 1);
   cfk::copy(tQgQ(_, 0), tQsQ(_, 0), tmaLoadQ, tma_load_mbar[0]);
   cute::wait_barrier(tma_load_mbar[0], 0); // This is REQUIRED.
+
+  //Initialize matmul objects.
+  TiledMma0 tiledMma0;
+  TiledMma1 tiledMma1;
+  auto threadMma0 = tiledMma0.get_thread_slice(threadIdx.x);
+  auto threadMma1 = tiledMma1.get_thread_slice(threadIdx.x);
+
+  // Allocate "fragments/descriptors"
+  // for first matmul.
+  Tensor tSrQ = threadMma0.partition_fragment_A(sQ);
+  Tensor tSrK = threadMma0.partition_fragment_B(sK);
+  Tensor tSrS = partition_fragment_C(tiledMma0, tileShapeS);
+  clear(tSrS);
+
+  // Allocate "fragments/descriptors"
+  // for second matmul.
+  // Note: S becomes P.
+  Tensor tOrV = threadMma1.partition_fragment_B(sVt);
+  Tensor tOrS = threadMma1.partition_fragment_A(sS(_, _, 0));
+  auto tOrPLayout = ReshapeTStoTP()(tSrS, tOrS);
 
 #ifdef QINRMEM
   Tensor tSsQ = threadMma0.partition_A(sQ);

@@ -269,7 +269,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   // If V is not assumed transposed in memory, then our choice of majorV changes
   // based on the precision type of V being FP16 or FP8 (-> MN major or K major).
   // This is because transposing the 2nd operand with WGMMA is currently supported
-  // for FP16 only. Thus for V FP8, we need to do the transpose ourselves.
+  // for FP16 only. Thus for V FP8, we would need to do the transpose ourselves.
   using TiledMma1 = decltype(cute::make_tiled_mma(
       rs_op_selector_custom<Mma2A, Mma2B, Mma2C, Shape<bM, bK, bN>,
                             GMMA::Major::K, majorV>(),
@@ -422,7 +422,9 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
 #ifdef GEMM2FP16
   using Gemm2Type = cutlass::half_t;
 #else
-  using Gemm2Type = PrecType;
+  // We don't support pure FP8 version yet, so disable for now
+  // using Gemm2Type = PrecType;
+  using Gemm2Type = cutlass::half_t;
 #endif
 
   constexpr float kLog2e = float(1.4426950408889634074); // log_2(e) = M_LOG2E

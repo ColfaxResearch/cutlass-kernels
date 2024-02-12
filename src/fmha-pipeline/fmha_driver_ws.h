@@ -75,6 +75,7 @@ template <class Gemm1Type, class AccumType, class SoftType, class Gemm2Type,
           class SrcSmemLayoutV, class SrcSmemLayoutAtomV, class TiledCopyO,
           class TileShapeO, class GmemLayoutO, class SmemLayoutO,
           class GmemLayoutMI, class ClusterShape>
+//we need to set launch bounds to use setmaxnreg
 __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
     Gemm1Type const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
     TileShapeQ tileShapeQ, GmemLayoutQ gmemLayoutQ, SmemLayoutQ smemLayoutQ,
@@ -111,23 +112,21 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
 
   auto cluster_shape = ClusterShape{};
   
+  // Unlike the unit test we always set this variable to 1
+  // independent of cluster size.
   uint32_t const NumProducers = 1;
 
-  // Get the full un-partitioned tensors.
-  // TMA tensors are special tensors.
-  Tensor mQ = tmaLoadQ.get_tma_tensor(shape(gmemLayoutQ));
-  // Tensor mK = tmaLoadK.get_tma_tensor(shape(gmemLayoutK));
-  // Tensor mV = tmaLoadV.get_tma_tensor(shape(gmemLayoutV));
-  // Tensor gK = local_tile(mK, tileShapeK, make_coord(0, 0, 0, 0));
-  // Tensor gV = local_tile(mV, tileShapeV, make_coord(0, 0, 0, 0));
+  // Get only TMA tensor mQ outside of producer loops.
+  Tensor mQ = tmaLoadQ.get_tma_tensor(shape(gmemLayoutQ));  
+  
+  // Compute TMA transaction bytes
   constexpr int per_cta_bytes = size(tileShapeK) * sizeof_bits_v<Gemm1Type> / 8 +
                                 size(tileShapeV) * sizeof_bits_v<Gemm2Type> / 8;
   uint32_t const TmaTransactionBytes = per_cta_bytes * NumProducers;
 
   // Construct SMEM tensors.
   Tensor sQ =
-      make_tensor(make_smem_ptr(shared_storage.qo.smem_q.data()), smemLayoutQ);
-  // Reuse sQ for sO (with new smem layout for FP8).
+      make_tensor(make_smem_ptr(shared_storage.qo.smem_q.data()), smemLayoutQ);  
   Tensor sO =
       make_tensor(make_smem_ptr(shared_storage.qo.smem_o.data()), smemLayoutO);
   Tensor sK =
@@ -145,28 +144,7 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
 
   // Tensor for V Transpose; used in GEMM-II.
   Tensor sVt =
-      make_tensor(make_smem_ptr(shared_storage.kv.smem_v.data()), smemLayoutVt);
-
-  Tensor mO = make_tensor(make_gmem_ptr(O), gmemLayoutO);
-
-  TiledMma0 tiledMma0;
-  TiledMma1 tiledMma1;
-  auto threadMma0 = tiledMma0.get_thread_slice(threadIdx.x);
-  auto threadMma1 = tiledMma1.get_thread_slice(threadIdx.x);
-
-  // Allocate "fragments/descriptors"
-  // for first matmul.
-  Tensor tSrQ = threadMma0.partition_fragment_A(sQ);
-  Tensor tSrK = threadMma0.partition_fragment_B(sK);
-  Tensor tSrS = partition_fragment_C(tiledMma0, tileShapeS);
-  clear(tSrS);
-
-  // Allocate "fragments/descriptors"
-  // for second matmul.
-  // Note: S becomes P.
-  Tensor tOrV = threadMma1.partition_fragment_B(sVt);
-  Tensor tOrS = threadMma1.partition_fragment_A(sS(_, _, 0));
-  auto tOrPLayout = ReshapeTStoTP()(tSrS, tOrS);
+      make_tensor(make_smem_ptr(shared_storage.kv.smem_v.data()), smemLayoutVt);  
 
   // Get the block coordinates for this CTA.
   auto blockIdxX = uint64_t(blockIdx.x);
@@ -199,6 +177,28 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
   cfk::barrierInit(tma_load_mbar[0], 1); // This is REQUIRED.
   cfk::copy(tQgQ(_, 0), tQsQ(_, 0), tmaLoadQ, tma_load_mbar[0]);
   cute::wait_barrier(tma_load_mbar[0], 0); // This is REQUIRED.
+  
+  // In the WS kernel, we still initialize matmul objects
+  // outside of the consumer body. This is done to avoid a
+  // synchronization problem with the QINRMEM flag enabled.  
+  TiledMma0 tiledMma0;
+  TiledMma1 tiledMma1;
+  auto threadMma0 = tiledMma0.get_thread_slice(threadIdx.x);
+  auto threadMma1 = tiledMma1.get_thread_slice(threadIdx.x);
+
+  // Allocate "fragments/descriptors"
+  // for first matmul.
+  Tensor tSrQ = threadMma0.partition_fragment_A(sQ);
+  Tensor tSrK = threadMma0.partition_fragment_B(sK);
+  Tensor tSrS = partition_fragment_C(tiledMma0, tileShapeS);
+  clear(tSrS);
+
+  // Allocate "fragments/descriptors"
+  // for second matmul.
+  // Note: S becomes P.
+  Tensor tOrV = threadMma1.partition_fragment_B(sVt);
+  Tensor tOrS = threadMma1.partition_fragment_A(sS(_, _, 0));
+  auto tOrPLayout = ReshapeTStoTP()(tSrS, tOrS);
 
 #ifdef QINRMEM
   Tensor tSsQ = threadMma0.partition_A(sQ);
@@ -239,6 +239,8 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
 
   // Producer warpgroup
   if (warp_group_idx == 0) {
+    // method in cutlass/arch/reg_reconfig.h
+    // calls setmaxnreg.dec.sync.aligned.u32
     cutlass::arch::warpgroup_reg_dealloc<40>();
 
     int lane_predicate = cute::elect_one_sync();
@@ -284,6 +286,8 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
   }
   // Consumer warpgroup(s)
   else if (warp_group_idx == 1 || warp_group_idx == 2) {
+    // method in cutlass/arch/reg_reconfig.h
+    // calls setmaxnreg.inc.sync.aligned.u32
     cutlass::arch::warpgroup_reg_alloc<232>();
     
     PipelineState smem_pipe_read;
@@ -302,14 +306,11 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
       pipeline.consumer_wait(smem_pipe_read);
       warpgroup_arrive();
 
-#if 1
       int stage = smem_pipe_read.index();
       fmhaForwardConsumer(Q, K, V, S, tSrQ, tSrK(_, _, _, stage), tSrS,
                           tOrV(_, _, _, stage), tOrO, tOrPLayout, rowMax,
                           rowSum, tileShapeS, gmemLayoutS, scale, blockIdxY++,
                           tiledMma0, tiledMma1, AccumType(0), SoftType(0));
-#endif
-
       ++smem_pipe_read;
     }
     gemm_k_iterations -= mma_k_prologue;
@@ -320,7 +321,6 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
       pipeline.consumer_wait(smem_pipe_read);
       warpgroup_arrive();
 
-#if 1
       int stage = smem_pipe_read.index();
       fmhaForwardConsumer(Q, K, V, S, tSrQ, tSrK(_, _, _, stage), tSrS,
                           tOrV(_, _, _, stage), tOrO, tOrPLayout, rowMax,
@@ -330,7 +330,6 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
       warpgroup_wait<2 * K_PIPE_MMAS>();
 //    warpgroup_fence_operand(tSrS);
 //    warpgroup_fence_operand(tOrO);
-#endif
 
       pipeline.consumer_release(smem_pipe_release);
 
@@ -345,7 +344,8 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
       pipeline.consumer_release(smem_pipe_release);
       ++smem_pipe_release;
     }
-
+    
+    // TMA Store epilogue
     bool leaderWarp = warp_group_idx == 1 && warp_idx_in_warpgroup == 0;
     fmhaForwardWriteOutTMA(tOrO, rowMax, rowSum, O, tileShapeO, gmemLayoutO,
                            mi_ptr, sPrimePtr, gmemLayoutMi, tiledMma0,

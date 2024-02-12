@@ -54,25 +54,22 @@ fmhaForwardConsumer(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V,
   copy(tSrS, tSgS);
 #endif
 
-#if 1
   if (blockIdxY == 0) { // Compute Online Softmax and NO Output Rescaling.
     onlineSoftmaxAndRescale<true, SoftType>(rowMax, rowSum, tSrS, tOrO, scale);
   } else { // Compute Online Softmax and Output Rescaling.
     onlineSoftmaxAndRescale<false, SoftType>(rowMax, rowSum, tSrS, tOrO, scale);
   }
   warpgroup_fence_operand(tSrS);
-#endif
 
-#if 1
   // ISSUE GEMM-II with Operand A from RMEM.
-  // Convert Operand A From SoftType [=float or half] to Gemm1Type [=half_t or
-  // fp8] before issuing.
+  // Convert Operand A from SoftType [=float or half] to Gemm2Type [=half_t or
+  // fp8] before issuing. Gemm2Type = fp8 not yet supported.
   auto tSrSPrec = convert_type<Gemm2Type, AccumType>(tSrS);
-  reorgCtoA<Gemm2Type, Gemm2Type>(tSrSPrec);
+  // this op disabled since we don't want to support pure fp8 yet
+  // reorgCtoA<Gemm2Type, Gemm2Type>(tSrSPrec);
   auto tOrP = make_tensor(tSrSPrec.data(), tOrPLayout);
   warpgroup_fence_operand(tSrS);
   cfk::gemm(tiledMma1, tOrP, tOrV, tOrO);
-#endif
 }
 
 // Epilogue that copies RMEM -> GMEM directly
