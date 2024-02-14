@@ -88,8 +88,7 @@ template <typename TensorA, typename TensorB>
 __device__ void copy(const TensorA &tA, TensorB &tB) {
   __syncthreads();
   copy(tA, tB);
-  cp_async_fence();
-  cp_async_wait<0>();
+  cutlass::arch::fence_view_async_shared();
   __syncthreads();
 }
 
