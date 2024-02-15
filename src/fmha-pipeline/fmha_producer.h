@@ -20,7 +20,7 @@ fmhaForwardProducer(Tensor<TensorEngineK, SmemLayoutK> &&sK,
   auto blockIdxB = uint64_t(blockIdx.z);
 
   // Get the full un-partitioned tensors.
-  // TMA tensors are special tensors.  
+  // TMA tensors are special tensors.
   Tensor mK = tmaLoadK.get_tma_tensor(shape(gmemLayoutK));
   Tensor mV = tmaLoadV.get_tma_tensor(shape(gmemLayoutV));
 
@@ -40,7 +40,7 @@ fmhaForwardProducer(Tensor<TensorEngineK, SmemLayoutK> &&sK,
   Tensor tVsV = group_modes<1, rank(tVsVX)>(tVsVX);
   static_assert(size<1>(tVsV) == 1);
   static_assert(size<1>(tKsK) == 1);
-  
+
   //
   // Get the GMEM tensors for K and V
   //

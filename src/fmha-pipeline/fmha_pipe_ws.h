@@ -1,12 +1,12 @@
 /***************************************************************************************************
- * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: BSD-3-Clause
+ * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights
+ *reserved. SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
  *
- * 1. Redistributions of source code must retain the above copyright notice, this
- * list of conditions and the following disclaimer.
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *this list of conditions and the following disclaimer.
  *
  * 2. Redistributions in binary form must reproduce the above copyright notice,
  * this list of conditions and the following disclaimer in the documentation
@@ -18,20 +18,21 @@
  *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
  * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ *ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ *LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ *CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ *SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ *INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ *CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ *ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ *POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
 
 /*! \file
     \brief Driver for the pipelined and warp-specialized FMHA kernel.
-    
+
     Based on the CUTLASS unit test for the PipelineTmaAsync class
     as it would be used in a warp-specialized loop.
 */
@@ -58,13 +59,13 @@
 #include "cutlass/arch/reg_reconfig.h"
 #include "cutlass/pipeline/pipeline.hpp"
 #include "fmha_consumer.h"
+#include "fmha_epilogue.h"
 #include "fmha_producer.h"
 #include "shared_storage.h"
 
 using namespace cute;
 using namespace cutlass;
 
-// Main WS FMHA Device Kernel.
 template <class Gemm1Type, class AccumType, class SoftType, class Gemm2Type,
           class OutputType, class TiledMma0, class TiledMma1, class TiledCopyQ,
           class TileShapeQ, class GmemLayoutQ, class SmemLayoutQ,
@@ -72,11 +73,10 @@ template <class Gemm1Type, class AccumType, class SoftType, class Gemm2Type,
           class SmemLayoutK, class TileShapeS, class GmemLayoutS,
           class SmemLayoutS, class TiledCopyV, class TileShapeV,
           class GmemLayoutV, class SmemLayoutV, class SmemLayoutVt,
-          class SrcSmemLayoutV, class SrcSmemLayoutAtomV, class TiledCopyO,
-          class TileShapeO, class GmemLayoutO, class SmemLayoutO,
-          class GmemLayoutMI, class ClusterShape>
-//we need to set launch bounds to use setmaxnreg
-__global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
+          class TiledCopyO, class TileShapeO, class GmemLayoutO,
+          class SmemLayoutO, class GmemLayoutMI, class ClusterShape>
+__global__ static void //__launch_bounds__(256, 1)
+fmhaForwardPipelinedWspl(
     Gemm1Type const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
     TileShapeQ tileShapeQ, GmemLayoutQ gmemLayoutQ, SmemLayoutQ smemLayoutQ,
     Gemm1Type const *K, CUTE_GRID_CONSTANT TiledCopyK const tmaLoadK,
@@ -85,13 +85,10 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
     SmemLayoutS smemLayoutS, int nTilesOfK, Gemm2Type *V,
     CUTE_GRID_CONSTANT TiledCopyV const tmaLoadV, TileShapeV tileShapeV,
     GmemLayoutV gmemLayoutV, SmemLayoutV smemLayoutV, SmemLayoutVt smemLayoutVt,
-    SrcSmemLayoutV srcSmemLayoutV, SrcSmemLayoutAtomV srcSmemLayoutAtomV,
     OutputType *O, CUTE_GRID_CONSTANT TiledCopyO const tmaStoreO,
     TileShapeO tileShapeO, GmemLayoutO gmemLayoutO, SmemLayoutO smemLayoutO,
     SoftType *mi_ptr, SoftType *sPrimePtr, GmemLayoutMI gmemLayoutMi,
-    float scale)
-
-{
+    float scale) {
   extern __shared__ char shared_memory[];
   using MainloopPipeline = typename cutlass::PipelineTmaAsync<stageCount>;
   // Change to this to use with CUTLASS 3.3 Pipeline API
@@ -113,22 +110,23 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
   dim3 block_id_in_cluster = cute::block_id_in_cluster();
 
   auto cluster_shape = ClusterShape{};
-  
+
   // Unlike the unit test we always set this variable to 1
   // independent of cluster size.
   uint32_t const NumProducers = 1;
 
   // Get only TMA tensor mQ outside of producer loops.
-  Tensor mQ = tmaLoadQ.get_tma_tensor(shape(gmemLayoutQ));  
-  
+  Tensor mQ = tmaLoadQ.get_tma_tensor(shape(gmemLayoutQ));
+
   // Compute TMA transaction bytes
-  constexpr int per_cta_bytes = size(tileShapeK) * sizeof_bits_v<Gemm1Type> / 8 +
-                                size(tileShapeV) * sizeof_bits_v<Gemm2Type> / 8;
+  constexpr int per_cta_bytes =
+      size(tileShapeK) * sizeof_bits_v<Gemm1Type> / 8 +
+      size(tileShapeV) * sizeof_bits_v<Gemm2Type> / 8;
   uint32_t const TmaTransactionBytes = per_cta_bytes * NumProducers;
 
   // Construct SMEM tensors.
   Tensor sQ =
-      make_tensor(make_smem_ptr(shared_storage.qo.smem_q.data()), smemLayoutQ);  
+      make_tensor(make_smem_ptr(shared_storage.qo.smem_q.data()), smemLayoutQ);
   Tensor sO =
       make_tensor(make_smem_ptr(shared_storage.qo.smem_o.data()), smemLayoutO);
   Tensor sK =
@@ -146,7 +144,7 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
 
   // Tensor for V Transpose; used in GEMM-II.
   Tensor sVt =
-      make_tensor(make_smem_ptr(shared_storage.kv.smem_v.data()), smemLayoutVt);  
+      make_tensor(make_smem_ptr(shared_storage.kv.smem_v.data()), smemLayoutVt);
 
   // Get the block coordinates for this CTA.
   auto blockIdxX = uint64_t(blockIdx.x);
@@ -169,8 +167,8 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
   auto kTiles = size<1>(tQgQ);
   assert(kTiles == 1);
   assert(kTiles == size<2>(gQ));
-  
-  // Partition the copying of dest tile for Q among threads.  
+
+  // Partition the copying of dest tile for Q among threads.
   Tensor tQsQX = cta_tmaQ.partition_D(sQ);
   Tensor tQsQ = group_modes<1, rank(tQsQX)>(tQsQX);
 
@@ -179,10 +177,10 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
   cfk::barrierInit(tma_load_mbar[0], 1); // This is REQUIRED.
   cfk::copy(tQgQ(_, 0), tQsQ(_, 0), tmaLoadQ, tma_load_mbar[0]);
   cute::wait_barrier(tma_load_mbar[0], 0); // This is REQUIRED.
-  
+
   // In the WS kernel, we still initialize matmul objects
   // outside of the consumer body. This is done to avoid a
-  // synchronization problem with the QINRMEM flag enabled.  
+  // synchronization problem with the QINRMEM flag enabled.
   TiledMma0 tiledMma0;
   TiledMma1 tiledMma1;
   auto threadMma0 = tiledMma0.get_thread_slice(threadIdx.x);
@@ -228,8 +226,7 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
   }
   params.is_leader = warp_group_thread_idx == 0;
   params.num_consumers = NumMmaThreads;
-   
-  
+
   MainloopPipeline pipeline(shared_storage.storage, params, cluster_shape);
   // Change to this to use with CUTLASS 3.3 Pipeline API
   // MainloopPipeline pipeline(shared_storage.storage, params);
@@ -252,14 +249,14 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
     if (warp_idx_in_warpgroup == 0 && lane_predicate) {
 
       int tma_k_prologue = min(stageCount, nTilesOfK);
-      
+
       // For the DMA (prologue) - we start with an opposite phase - since we
       // skip all waits i.e., we know that the buffer is indeed empty
       PipelineState smem_pipe_write =
           make_producer_start_state<MainloopPipeline>();
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < tma_k_prologue; ++i) {
-        pipeline.producer_acquire(smem_pipe_write);        
+        pipeline.producer_acquire(smem_pipe_write);
         BarrierType *tmaBar = pipeline.producer_get_barrier(smem_pipe_write);
         fmhaForwardProducer(sK(_, _, i), tmaLoadK, tileShapeK, gmemLayoutK,
                             sV(_, _, i), tmaLoadV, tileShapeV, gmemLayoutV,
@@ -267,10 +264,10 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
         ++smem_pipe_write;
       }
       int tma_k_iter = nTilesOfK - tma_k_prologue;
-      
+
       CUTE_NO_UNROLL
       for (; tma_k_iter > 0; --tma_k_iter) {
-        pipeline.producer_acquire(smem_pipe_write);        
+        pipeline.producer_acquire(smem_pipe_write);
         BarrierType *tmaBar = pipeline.producer_get_barrier(smem_pipe_write);
         auto stage = smem_pipe_write.index();
         fmhaForwardProducer(sK(_, _, stage), tmaLoadK, tileShapeK, gmemLayoutK,
@@ -287,14 +284,14 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
         pipeline.producer_acquire(tail);
         ++tail;
       }
-    }    
+    }
   }
   // Consumer warpgroup(s)
   else if (warp_group_idx == 1 || warp_group_idx == 2) {
     // method in cutlass/arch/reg_reconfig.h
     // calls setmaxnreg.inc.sync.aligned.u32
     cutlass::arch::warpgroup_reg_alloc<232>();
-    
+
     PipelineState smem_pipe_read;
     PipelineState smem_pipe_release;
 
@@ -304,7 +301,7 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
 
     // Total number of gemm iterations
     auto gemm_k_iterations = nTilesOfK;
-    
+
     int mma_k_prologue = min(K_PIPE_MMAS, gemm_k_iterations);
     CUTLASS_PRAGMA_UNROLL
     for (int iter = 0; iter < mma_k_prologue; ++iter) {
@@ -319,7 +316,7 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
       ++smem_pipe_read;
     }
     gemm_k_iterations -= mma_k_prologue;
-    
+
     CUTLASS_PRAGMA_NO_UNROLL
     for (; gemm_k_iterations > 0; --gemm_k_iterations) {
       /// Wait on the smem_pipe_read stage / phase
@@ -333,8 +330,8 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
                           tiledMma0, tiledMma1, AccumType(0), SoftType(0));
 
       warpgroup_wait<2 * K_PIPE_MMAS>();
-//    warpgroup_fence_operand(tSrS);
-//    warpgroup_fence_operand(tOrO);
+      //    warpgroup_fence_operand(tSrS);
+      //    warpgroup_fence_operand(tOrO);
 
       pipeline.consumer_release(smem_pipe_release);
 
@@ -349,11 +346,17 @@ __global__ static void __launch_bounds__(384, 1) fmhaForwardWS(
       pipeline.consumer_release(smem_pipe_release);
       ++smem_pipe_release;
     }
-    
+
     // TMA Store epilogue
     bool leaderWarp = warp_group_idx == 1 && warp_idx_in_warpgroup == 0;
     fmhaForwardWriteOutTMA(tOrO, rowMax, rowSum, O, tileShapeO, gmemLayoutO,
-                           mi_ptr, sPrimePtr, gmemLayoutMi, tiledMma0,
-                           tiledMma1, sO, tmaStoreO, leaderWarp);
+                           tiledMma1, sO, tmaStoreO, leaderWarp, SoftType(0.0));
+
+// Write out rowMax and rowSum to GMEM.
+// Required for verification ONLY.
+#ifdef COPYOUTMI
+    fmhaForwardWriteOutSoftMax(rowMax, rowSum, mi_ptr, sPrimePtr, gmemLayoutMi,
+                               tiledMma0, tileShapeO);
+#endif
   }
 }

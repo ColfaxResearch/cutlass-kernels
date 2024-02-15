@@ -13,6 +13,19 @@
 #include "cutlass/tensor_ref.h"
 #include <cute/tensor.hpp>
 
+// Conversion Utility to convert RMEM from one type to another.
+// Used for conversion from AccumType to PrecType.
+template <typename To_type, typename From_type, typename Fragment>
+inline __device__ auto convert_type(Fragment const &tensor) {
+  constexpr int numel = decltype(size(tensor))::value;
+  cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
+  // Note: this requires tensor to be "contiguous."
+  auto frag =
+      convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(
+          tensor.data()));
+  return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
+}
+
 // Reshape Utility for converting the layout from accumulator of GEMM-I
 // to Operand A of GEMM-II.
 struct ReshapeTStoTP {

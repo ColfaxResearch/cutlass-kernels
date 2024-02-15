@@ -14,12 +14,13 @@ constexpr int kKeysPerBlock = KBLKSIZE;
 constexpr int kKeysPerBlock = 64;
 #endif
 
-// Default stage count is 2
 #ifdef STAGECOUNT
 constexpr int stageCount = STAGECOUNT;
 #else
 constexpr int stageCount = 2;
 #endif
+
+constexpr int NumCopyThreads = 128;
 
 #ifdef CTA256
 constexpr int NumMmaWarpGroups = 2;
@@ -28,6 +29,8 @@ constexpr int NumMmaThreads = 256;
 constexpr int NumMmaWarpGroups = 1;
 constexpr int NumMmaThreads = 128;
 #endif
+
+#include "cutlass/pipeline/pipeline.hpp"
 
 // Shared Storage with Aligned addresses.
 template <class Gemm1Type, class OutputType, class SmemLayoutQ,
@@ -61,9 +64,8 @@ struct SharedStorage {
         kv;
   };
   struct {
-    cute::uint64_t tma_load_mbar[1];
-    typename cutlass::PipelineTmaAsync<stageCount>::SharedStorage
-        storage;
+    cute::uint64_t tma_load_mbar[8]; // 8 TMA barrier pre-allcoated for usage.
+    typename cutlass::PipelineTmaAsync<stageCount>::SharedStorage storage;
   };
 };
 #else
@@ -78,9 +80,8 @@ struct SharedStorage {
         kv;
   };
   struct {
-    cute::uint64_t tma_load_mbar[1];
-    typename cutlass::PipelineTmaAsync<stageCount>::SharedStorage
-        storage;
+    cute::uint64_t tma_load_mbar[8]; // 8 TMA barriers pre-allocated for usage.
+    typename cutlass::PipelineTmaAsync<stageCount>::SharedStorage storage;
   };
 };
 #endif

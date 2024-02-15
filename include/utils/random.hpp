@@ -1,3 +1,5 @@
+#pragma once
+
 #include "cutlass/util/distribution.h"
 #include "cutlass/util/reference/device/tensor_fill.h"
 
