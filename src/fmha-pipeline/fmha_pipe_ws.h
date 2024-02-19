@@ -75,7 +75,7 @@ template <class Gemm1Type, class AccumType, class SoftType, class Gemm2Type,
           class GmemLayoutV, class SmemLayoutV, class SmemLayoutVt,
           class TiledCopyO, class TileShapeO, class GmemLayoutO,
           class SmemLayoutO, class GmemLayoutMI, class ClusterShape>
-__global__ static void //__launch_bounds__(256, 1)
+__global__ static void __launch_bounds__(384, 1)
 fmhaForwardPipelinedWspl(
     Gemm1Type const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
     TileShapeQ tileShapeQ, GmemLayoutQ gmemLayoutQ, SmemLayoutQ smemLayoutQ,
@@ -178,6 +178,7 @@ fmhaForwardPipelinedWspl(
   cfk::copy(tQgQ(_, 0), tQsQ(_, 0), tmaLoadQ, tma_load_mbar[0]);
   cute::wait_barrier(tma_load_mbar[0], 0); // This is REQUIRED.
 
+
   // In the WS kernel, we still initialize matmul objects
   // outside of the consumer body. This is done to avoid a
   // synchronization problem with the QINRMEM flag enabled.
@@ -193,17 +194,18 @@ fmhaForwardPipelinedWspl(
   Tensor tSrS = partition_fragment_C(tiledMma0, tileShapeS);
   clear(tSrS);
 
+#ifdef QINRMEM
+  Tensor tSsQ = threadMma0.partition_A(sQ);
+  cfk::copy_nosync(tSsQ, tSrQ);
+  warpgroup_fence_operand(tSrQ);
+#endif
   // Allocate "fragments/descriptors"
   // for second matmul.
   // Note: S becomes P.
   Tensor tOrV = threadMma1.partition_fragment_B(sVt);
   Tensor tOrS = threadMma1.partition_fragment_A(sS(_, _, 0));
   auto tOrPLayout = ReshapeTStoTP()(tSrS, tOrS);
-
-#ifdef QINRMEM
-  Tensor tSsQ = threadMma0.partition_A(sQ);
-  cfk::copy(tSsQ, tSrQ);
-#endif
+  auto reg2reg = ReorgCFp8toAFp8();
 
   // FMHA OUTPUT (GEMM-II) accumulator.
   Tensor tOrO = partition_fragment_C(tiledMma1, tileShapeO);
@@ -243,7 +245,7 @@ fmhaForwardPipelinedWspl(
   if (warp_group_idx == 0) {
     // method in cutlass/arch/reg_reconfig.h
     // calls setmaxnreg.dec.sync.aligned.u32
-    cutlass::arch::warpgroup_reg_dealloc<40>();
+    cutlass::arch::warpgroup_reg_dealloc<80>();
 
     int lane_predicate = cute::elect_one_sync();
     if (warp_idx_in_warpgroup == 0 && lane_predicate) {
@@ -290,7 +292,7 @@ fmhaForwardPipelinedWspl(
   else if (warp_group_idx == 1 || warp_group_idx == 2) {
     // method in cutlass/arch/reg_reconfig.h
     // calls setmaxnreg.inc.sync.aligned.u32
-    cutlass::arch::warpgroup_reg_alloc<232>();
+    cutlass::arch::warpgroup_reg_alloc<192>();
 
     PipelineState smem_pipe_read;
     PipelineState smem_pipe_release;
@@ -303,6 +305,7 @@ fmhaForwardPipelinedWspl(
     auto gemm_k_iterations = nTilesOfK;
 
     int mma_k_prologue = min(K_PIPE_MMAS, gemm_k_iterations);
+
     CUTLASS_PRAGMA_UNROLL
     for (int iter = 0; iter < mma_k_prologue; ++iter) {
       pipeline.consumer_wait(smem_pipe_read);
@@ -310,7 +313,7 @@ fmhaForwardPipelinedWspl(
 
       int stage = smem_pipe_read.index();
       fmhaForwardConsumer(Q, K, V, S, tSrQ, tSrK(_, _, _, stage), tSrS,
-                          tOrV(_, _, _, stage), tOrO, tOrPLayout, rowMax,
+                          tOrV(_, _, _, stage), tOrO, tOrPLayout, reg2reg, rowMax,
                           rowSum, tileShapeS, gmemLayoutS, scale, blockIdxY++,
                           tiledMma0, tiledMma1, AccumType(0), SoftType(0));
       ++smem_pipe_read;
@@ -325,7 +328,7 @@ fmhaForwardPipelinedWspl(
 
       int stage = smem_pipe_read.index();
       fmhaForwardConsumer(Q, K, V, S, tSrQ, tSrK(_, _, _, stage), tSrS,
-                          tOrV(_, _, _, stage), tOrO, tOrPLayout, rowMax,
+                          tOrV(_, _, _, stage), tOrO, tOrPLayout, reg2reg, rowMax,
                           rowSum, tileShapeS, gmemLayoutS, scale, blockIdxY++,
                           tiledMma0, tiledMma1, AccumType(0), SoftType(0));
 

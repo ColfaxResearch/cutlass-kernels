@@ -53,7 +53,7 @@ fmhaForwardProducer(Tensor<TensorEngineK, SmemLayoutK> &&sK,
   assert(size<1>(tKgK) == kTiles);
   static_assert(size<1>(tKsK) == 1);
 
-#ifdef VTRANS
+#ifdef GEMM2FP8
   auto blkCoordV = make_coord(0, blockIdxY, blockIdxH, blockIdxB);
 #else
   auto blkCoordV = make_coord(blockIdxY, 0, blockIdxH, blockIdxB);

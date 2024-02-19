@@ -75,11 +75,36 @@ CUTLASS_DEVICE static void reorgCFp8toAFp8NoShfl(Fragment &accum) {
   }
 }
 
-template <typename Fragment>
-CUTLASS_DEVICE static void reorgCFp8toAFp8(Fragment &accum) {
+struct ReorgCFp8toAFp8{
+  int selectorEx0;
+  int selectorEx1;  
+  int selectorEx4;
+  int selectorEx5;
+  int upper_map[4] = {0,3,1,2};
+  int lower_map[4] = {1,2,0,3};
+  
+  
+CUTLASS_DEVICE ReorgCFp8toAFp8() {
+  int laneId = cutlass::canonical_lane_idx();
+  
+   if (laneId % 4 == 0 || laneId % 4 == 3) {
+     selectorEx0 = 0x3210;
+     selectorEx1 = 0x7654;
+     selectorEx4 = 0x5410;
+	   selectorEx5 = 0x7632;
+   } else {
+     selectorEx0 = 0x7654;
+     selectorEx1 = 0x3210;
+     selectorEx4 = 0x1054;
+	   selectorEx5 = 0x3276;
+   }  
+   
+}
 
-  using namespace cute;
-  auto laneId = cutlass::canonical_lane_idx();
+template <typename Fragment>
+CUTLASS_DEVICE auto operator()(Fragment &accum) {
+
+  using namespace cute;  
 
   // First update `mi` to the max per-row
   //
@@ -98,59 +123,102 @@ CUTLASS_DEVICE static void reorgCFp8toAFp8(Fragment &accum) {
 #pragma unroll
     for (int k = 0; k < NT * size<2>(VT) / 2; ++k) {
 
-      // d0, d1, d2, d3.
-      int32_t upper;
-      cutlass::float_e4m3_t *byte0 = (cutlass::float_e4m3_t *)&upper + 0;
-      cutlass::float_e4m3_t *byte1 = (cutlass::float_e4m3_t *)&upper + 1;
-      cutlass::float_e4m3_t *byte2 = (cutlass::float_e4m3_t *)&upper + 2;
-      cutlass::float_e4m3_t *byte3 = (cutlass::float_e4m3_t *)&upper + 3;
-
-      // d4, d5, d6, d7.
-      int32_t lower;
-      cutlass::float_e4m3_t *byte4 = (cutlass::float_e4m3_t *)&lower + 0;
-      cutlass::float_e4m3_t *byte5 = (cutlass::float_e4m3_t *)&lower + 1;
-      cutlass::float_e4m3_t *byte6 = (cutlass::float_e4m3_t *)&lower + 2;
-      cutlass::float_e4m3_t *byte7 = (cutlass::float_e4m3_t *)&lower + 3;
-
-      *byte0 = data[n];
-      *byte1 = data[n + 1];
-      *byte2 = data[n + 2];
-      *byte3 = data[n + 3];
-      *byte4 = data[n + 4];
-      *byte5 = data[n + 5];
-      *byte6 = data[n + 6];
-      *byte7 = data[n + 7];
-
-      int32_t *exVal0;
-      if (laneId % 4 == 0 || laneId % 4 == 1) {
-        exVal0 = &lower;
-      } else {
-        exVal0 = &upper;
-      }
-
-      *exVal0 = __shfl_xor_sync(uint32_t(-1), *exVal0, 2);
-
-      int32_t *exVal1;
-      if (laneId % 2 == 0) {
-        exVal1 = &lower;
-      } else {
-        exVal1 = &upper;
-      }
-
-      *exVal1 = __shfl_xor_sync(uint32_t(-1), *exVal1, 1);
-
-      data[n++] = *byte0;
-      data[n++] = *byte1;
-      data[n++] = *byte4;
-      data[n++] = *byte5;
-
-      data[n++] = *byte2;
-      data[n++] = *byte3;
-      data[n++] = *byte6;
-      data[n++] = *byte7;
+      auto upper = *reinterpret_cast<uint32_t*>(&data[n]);
+      auto lower = *reinterpret_cast<uint32_t*>(&data[n+4]);
+      
+      auto upper0 = __byte_perm(upper, lower, selectorEx0);
+      auto lower0 = __byte_perm(upper, lower, selectorEx1);      
+      upper0 = __shfl_sync(uint32_t(-1),upper0, upper_map[threadIdx.x%4],4);
+      lower0 = __shfl_sync(uint32_t(-1),lower0, lower_map[threadIdx.x%4],4);
+  
+      uint32_t *data_32bit = reinterpret_cast<uint32_t *>(&data[n]);
+      data_32bit[0] = __byte_perm(upper0, lower0, selectorEx4);
+      data_32bit[1] = __byte_perm(upper0, lower0, selectorEx5);
+      n += 8;
     }
   }
 }
+};
+
+// Alternative version: tested to be slightly slower
+// struct ReorgCFp8toAFp8{
+//   int selectorEx0;
+//   int selectorEx1;
+//   int selectorEx2;
+//   int selectorEx3;
+//   int selectorEx4;
+//   int selectorEx5;
+  
+  
+// CUTLASS_DEVICE ReorgCFp8toAFp8() {
+//   auto laneId = cutlass::canonical_lane_idx();
+//    if (laneId % 4 == 0 || laneId % 4 == 1) {
+//      selectorEx0 = 0x3210;
+//      selectorEx1 = 0x7654;
+//    } else {
+//      selectorEx0 = 0x7654;
+//      selectorEx1 = 0x3210;
+//    }
+//    if (laneId % 4  == 0 || laneId % 4 == 3) {
+// 	   selectorEx2 = 0x3210;
+// 	   selectorEx3 = 0x7654;
+//    } else {
+// 	   selectorEx2 = 0x7654;
+// 	   selectorEx3 = 0x3210;
+//    }
+   
+//    if (laneId % 2  == 0) {
+// 	   selectorEx4 = 0x5410;
+// 	   selectorEx5 = 0x7632;
+//    } else { // 1 & 3.
+// 	   selectorEx4 = 0x1054;
+// 	   selectorEx5 = 0x3276;
+//    }
+
+// }
+
+// template <typename Fragment>
+// CUTLASS_DEVICE auto operator()(Fragment &accum) {
+
+//   using namespace cute;
+
+//   // First update `mi` to the max per-row
+//   //
+//   auto VT = shape<0>(accum); // number of vector elements per tile.
+//   auto MT = shape<1>(accum); // number of tiles along M.
+//   auto NT = shape<2>(accum); // number of tiles along N.
+
+//   auto data = accum.data();
+//   int n = 0;
+
+// #pragma unroll
+//   for (int i = 0; i < MT; ++i) {
+
+//     // Traverse 2-rows + 2-cols (2x2) simultaneously.
+
+// #pragma unroll
+//     for (int k = 0; k < NT * size<2>(VT) / 2; ++k) {
+
+//       auto upper = *reinterpret_cast<uint32_t*>(&data[n]);
+//       auto lower = *reinterpret_cast<uint32_t*>(&data[n+4]);
+      
+//       auto upper0 = __byte_perm(upper, lower, selectorEx0);
+//       auto lower0 = __byte_perm(upper, lower, selectorEx1);
+//       lower0 = __shfl_xor_sync(uint32_t(-1), lower0, 2);
+//       auto upper2 = __byte_perm(upper0, lower0, selectorEx2);
+//       auto lower2 = __byte_perm(upper0, lower0, selectorEx3);
+//       lower2 = __shfl_xor_sync(uint32_t(-1), lower2, 1);
+//       upper = __byte_perm(upper2, lower2, selectorEx4);
+//       lower = __byte_perm(upper2, lower2, selectorEx5);
+  
+//       uint32_t *data_32bit = reinterpret_cast<uint32_t *>(&data[n]);
+//       data_32bit[0] = upper;
+//       data_32bit[1] = lower;
+//       n += 8;
+//     }
+//   }
+// }
+// };
 
 // First version (used for debugging)
 // TODO: Remove in future.

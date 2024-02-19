@@ -8,13 +8,13 @@
 template <class Gemm1Type, class AccumType, class SoftType, class Gemm2Type,
           class TiledMma0, class TiledMma1, class TileShapeS, class GmemLayoutS,
           typename TensorQ, typename TensorK, typename TensorS,
-          typename TensorV, typename TensorO, typename RegLayout,
+          typename TensorV, typename TensorO, typename RegLayout, typename Reg2Reg,
           typename RowMax, typename RowSum>
 __device__ static void //__launch_bounds__(128, 2)
 fmhaForwardConsumer(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V,
                     Gemm1Type *S, const TensorQ &tSrQ, const TensorK &tSrK,
                     TensorS &&tSrS, const TensorV &tOrV, TensorO &tOrO,
-                    const RegLayout &tOrPLayout, RowMax &rowMax, RowSum &rowSum,
+                    const RegLayout &tOrPLayout, Reg2Reg & reg2reg, RowMax &rowMax, RowSum &rowSum,
                     const TileShapeS &tileShapeS,
                     const GmemLayoutS &gmemLayoutS, float scale, int blockIdxY,
                     const TiledMma0 &tiledMma0, const TiledMma1 &tiledMma1,
@@ -52,8 +52,9 @@ fmhaForwardConsumer(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V,
   // Convert Operand A from SoftType [=float or half] to Gemm2Type [=half_t or
   // fp8] before issuing. Gemm2Type = fp8 not yet supported.
   auto tSrSPrec = convert_type<Gemm2Type, AccumType>(tSrS);
-  // this op disabled since we don't want to support pure fp8 yet
-  // reorgCtoA<Gemm2Type, Gemm2Type>(tSrSPrec);
+#ifdef GEMM2FP8
+  reg2reg(tSrSPrec);
+#endif
   auto tOrP = make_tensor(tSrSPrec.data(), tOrPLayout);
   warpgroup_fence_operand(tSrS);
   cfk::gemm(tiledMma1, tOrP, tOrV, tOrO);

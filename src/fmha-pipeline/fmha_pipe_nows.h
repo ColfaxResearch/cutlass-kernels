@@ -199,6 +199,7 @@ fmhaForwardPipelinedNoWspl(
   Tensor tOrV = threadMma1.partition_fragment_B(sVt);
   Tensor tOrS = threadMma1.partition_fragment_A(sS(_, _, 0));
   auto tOrPLayout = ReshapeTStoTP()(tSrS, tOrS);
+  auto reg2reg = ReorgCFp8toAFp8();
 
 #ifdef QINRMEM
   Tensor tSsQ = threadMma0.partition_A(sQ);
@@ -275,7 +276,7 @@ fmhaForwardPipelinedNoWspl(
     int stage = smem_pipe_read.index();
 
     fmhaForwardConsumer(Q, K, V, S, tSrQ, tSrK(_, _, _, stage), tSrS,
-                        tOrV(_, _, _, stage), tOrO, tOrPLayout, rowMax, rowSum,
+                        tOrV(_, _, _, stage), tOrO, tOrPLayout, reg2reg, rowMax, rowSum,
                         tileShapeS, gmemLayoutS, scale, blockIdxYCons++,
                         tiledMma0, tiledMma1, AccumType(0), SoftType(0));
     ++smem_pipe_read;
@@ -290,7 +291,7 @@ fmhaForwardPipelinedNoWspl(
     int stage = smem_pipe_read.index();
 
     fmhaForwardConsumer(Q, K, V, S, tSrQ, tSrK(_, _, _, stage), tSrS,
-                        tOrV(_, _, _, stage), tOrO, tOrPLayout, rowMax, rowSum,
+                        tOrV(_, _, _, stage), tOrO, tOrPLayout, reg2reg, rowMax, rowSum,
                         tileShapeS, gmemLayoutS, scale, blockIdxYCons++,
                         tiledMma0, tiledMma1, AccumType(0), SoftType(0));
 

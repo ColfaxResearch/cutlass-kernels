@@ -178,7 +178,7 @@ fmhaForwardNoPipeline(
 // will also read from SMEM. By default, this flag is disabled.
 #ifdef SINSMEM
   Tensor tSsS = threadMma0.partition_C(sS);
-  cute::fill(tSsS, Gemm1Type(0.0));
+  cute::fill(tSsS, Gemm2Type(0.0));
   Tensor tOrP = threadMma1.partition_fragment_A(sS);
 #else
   Tensor tOrS = threadMma1.partition_fragment_A(sS);
@@ -186,6 +186,7 @@ fmhaForwardNoPipeline(
   auto tOrP = make_tensor(tSrS.data(), tOrPLayout);
 #endif
 
+  auto reg2reg = ReorgCFp8toAFp8();
   // Allocate space for per-thread rowMax and rowSum in rmem.
   Tensor rowMax = make_tensor<AccumType>(Shape<Int<2 * size<1>(tSrS)>>{});
   Tensor rowSum = make_fragment_like(rowMax);
@@ -223,7 +224,51 @@ fmhaForwardNoPipeline(
 #ifdef QINRMEM
   Tensor tSsQ = threadMma0.partition_A(sQ);
   cfk::copy(tSsQ, tSrQ);
+  cute::cluster_sync();
 #endif
+
+  // mbarrier.init
+  using MainloopPipeline = typename cutlass::PipelineTmaAsync<stageCount>;
+  using PipelineState = typename cutlass::PipelineState<stageCount>;
+  // using BarrierType = typename MainloopPipeline::ProducerBarrierType;
+  // Compute TMA transaction bytes
+  constexpr int per_cta_bytes =
+      size(tileShapeK) * sizeof_bits_v<Gemm1Type> / 8 +
+      size(tileShapeV) * sizeof_bits_v<Gemm2Type> / 8;
+  uint32_t const TmaTransactionBytes = per_cta_bytes;
+  int warp_group_thread_idx = threadIdx.x % 128;
+  // dim3 block_id_in_cluster = cute::block_id_in_cluster();
+
+  typename MainloopPipeline::Params params;
+  params.transaction_bytes = TmaTransactionBytes;
+  params.role = MainloopPipeline::ThreadCategory::ProducerConsumer;
+  params.is_leader = warp_group_thread_idx == 0;
+
+  params.num_consumers = NumMmaThreads;
+  auto cluster_shape = ClusterShape{};
+
+  MainloopPipeline pipeline(shared_storage.storage, params, cluster_shape);
+
+  __syncthreads();
+
+  // Ensure All CTAs in Cluster have completed init before issuing commits
+  cute::cluster_arrive_relaxed();
+  cute::cluster_wait();
+
+  PipelineState smem_pipe_read;
+  // For the DMA (prologue) - we start with an opposite phase - since we skip all waits
+  // i.e., we know that the buffer is indeed empty
+  PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipeline>();
+  PipelineState smem_pipe_release;
+
+  int k_pipe_tma_prologue = 1;
+
+  for(int i = 0; i < k_pipe_tma_prologue; ++i) {
+    pipeline.producer_acquire(smem_pipe_write);
+    // cp.async.bulk.tensor would typically happen here
+    pipeline.producer_commit(smem_pipe_write, per_cta_bytes);
+    ++smem_pipe_write;
+  }
 
   // Initialize phase for barriers 0 and 1.
   int phase = 0;
@@ -232,7 +277,12 @@ fmhaForwardNoPipeline(
   for (uint64_t blockIdxY = 0; blockIdxY < nTilesOfK; ++blockIdxY) {
 
     // Prepare Tensors for V copy on GMEM side.
+#ifdef GEMM2FP8
+    auto blkCoordV = make_coord(0, blockIdxY, blockIdxH, blockIdxB);
+#else
     auto blkCoordV = make_coord(blockIdxY, 0, blockIdxH, blockIdxB);
+#endif
+
     Tensor gV = local_tile(mV, tileShapeV, blkCoordV);
     Tensor tVgVX = cta_tmaV.partition_S(gV);
     Tensor tVgV = group_modes<1, rank(tVgVX)>(tVgVX);
@@ -280,13 +330,49 @@ fmhaForwardNoPipeline(
 #ifdef SINSMEM
     // ISSUE GEMM-II with Operand A from SMEM.
     // Copy OperandA from RMEM to SMEM before issuing.
+#if 0
+    if (cute::thread0()) {
+         print ("before : \n");
+         print_tensor(tSrS);
+    }
+         __syncthreads();
+#endif
+
     cfk::copy(tSrS, tSsS);
+#if 1
+    if (cute::thread0()) {
+         print ("after : \n");
+         print_tensor(tSsS);
+    }
+         __syncthreads();
+#endif
+
     cfk::gemm_ldbar(tiledMma1, tOrP, tOrV, tOrO, tma_load_mbar[1], phase);
 #else
     // ISSUE GEMM-II with Operand A from RMEM.
     // Convert Operand A From AccumType [=float] to PrecType [=half_t] before
     // issuing.
-    cfk::gemm_ldbar(tiledMma1, convert_type<Gemm2Type, AccumType>(tOrP), tOrV,
+    auto tSrSPrec = convert_type<Gemm2Type, AccumType>(tSrS);
+#if 0
+    if (cute::thread0()) {
+         print ("before : \n");
+         print_tensor(tSrS);
+    }
+         __syncthreads();
+#endif
+#ifdef GEMM2FP8
+    reg2reg(tSrSPrec);
+#endif
+#if 0
+    if (cute::thread0()) {
+         print ("after : \n");
+         print_tensor(tSrSPrec);
+    }
+         __syncthreads();
+#endif
+    auto tOrP = make_tensor(tSrSPrec.data(), tOrPLayout);
+    warpgroup_fence_operand(tSrS);
+    cfk::gemm_ldbar(tiledMma1, tOrP, tOrV,
                     tOrO, tma_load_mbar[1], phase);
 #endif
     // Flip phase for barrier.

@@ -180,7 +180,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
 // We assume V is NOT transposed in memory by default.
 // Currently, we only support V FP16, so only one branch in this code is taken.
 // We have left the other branch in with a view to future work with V FP8.
-#ifndef VTRANS
+#ifndef GEMM2FP8
   auto tileShapeV = make_shape(bN{}, bK{});
   auto smemLayoutAtomV =
       cute::conditional_return<is_same_v<Mma2B, cutlass::half_t>>(
@@ -226,10 +226,10 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
 #else
   auto tileShapeV = make_shape(bK{}, bN{});
   auto smemLayoutAtomV = getSmemLayoutK<Mma2B, bN{}>();
-  // auto smemLayoutAtomV = GMMA::Layout_K_INTER_Atom<Mma2B>{};
+  //auto smemLayoutAtomV = GMMA::Layout_K_INTER_Atom<Mma2B>{};
   auto smemLayoutV = tile_to_shape(
       smemLayoutAtomV,
-      make_shape(shape<0>(tileShapeV), shape<1>(tileShapeV), Int<1>{}));
+      make_shape(shape<0>(tileShapeV), shape<1>(tileShapeV), STAGES()));
   Layout gmemLayoutV =
       make_layout(make_shape(K, N, H, B), make_stride(N * H, 1, N, H * K * N));
   Tensor gV = make_tensor(ptrV, gmemLayoutV);
@@ -442,11 +442,11 @@ template <typename PrecType, int HEADDIM>
 void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
                      bool refCheck, bool printValues, bool printDiffs,
                      int nStreams) {
-#ifdef GEMM2FP16
-  using Gemm2Type = cutlass::half_t;
-#else
+#ifdef GEMM2FP8
   // We don't support pure FP8 version yet, so disable for now
-  // using Gemm2Type = PrecType;
+  //using Gemm2Type = cutlass::half_t;
+  using Gemm2Type = PrecType;
+#else
   using Gemm2Type = cutlass::half_t;
 #endif
 
@@ -483,9 +483,12 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
   cutlass::Distribution::Kind initK;
   cutlass::Distribution::Kind initV;
   if (refCheck) {
-    initQ = cutlass::Distribution::Uniform;
-    initK = cutlass::Distribution::Uniform;
-    initV = cutlass::Distribution::Uniform;
+    // initQ = cutlass::Distribution::Uniform;
+    // initK = cutlass::Distribution::Uniform;
+    // initV = cutlass::Distribution::Uniform;
+    initQ = cutlass::Distribution::Gaussian;
+    initK = cutlass::Distribution::Gaussian;
+    initV = cutlass::Distribution::Gaussian;
   } else {
     initQ = cutlass::Distribution::Gaussian;
     initK = cutlass::Distribution::Gaussian;
@@ -508,7 +511,7 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
 
 // For our experiments with V transposed in memory,
 // we view the cost of the transpose as offline.
-#ifdef VTRANS
+#ifdef GEMM2FP8
   thrust::host_vector<Gemm2Type> hostVt = hostV;
 
   int batchStride = m * numHeads * HEADDIM;
@@ -741,6 +744,7 @@ int main(int argc, char const **argv) {
   // For now, only half_t and e4m3_t are supported.
   // Though it's simple to also add e5m2_t.
   if (precType == 1) {
+    #ifndef GEMM2FP8
     if (kHeadSize == 64) {
       testFmhaForward<cutlass::half_t, 64>(seqLength, seqLength, numHeads,
                                            batchSize, iterations, refCheck,
@@ -757,18 +761,19 @@ int main(int argc, char const **argv) {
       std::cout << "Unsupported head dim: " << kHeadSize << std::endl;
       exit(-1);
     }
+    #else
+      std::cout << "FP16 not supported when GEMM2FP8 is enabled." << std::endl;
+      exit(-1);
+    #endif
   }
   // For FP8, we choose e4m3 according to the following philosophy:
   // e4m3 for inference (forward pass), e5m2 for training (backward pass).
   else if (precType == 2) {
 #if 1
     if (kHeadSize == 64) {
-      // We disable GEMM2FP16 for now (always set to true)
-      // #if defined(VTRANS) || defined(GEMM2FP16) || (KBLKSIZE == 64)
       testFmhaForward<cutlass::float_e4m3_t, 64>(
           seqLength, seqLength, numHeads, batchSize, iterations, refCheck,
           printValues, printDiffs, nStreams);
-      // #endif
     } else if (kHeadSize == 128) {
       testFmhaForward<cutlass::float_e4m3_t, 128>(
           seqLength, seqLength, numHeads, batchSize, iterations, refCheck,
