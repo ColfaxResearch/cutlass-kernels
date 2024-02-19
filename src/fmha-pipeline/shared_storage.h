@@ -14,10 +14,11 @@ constexpr int kKeysPerBlock = KBLKSIZE;
 constexpr int kKeysPerBlock = 64;
 #endif
 
+// Default number of stages is 3.
 #ifdef STAGECOUNT
 constexpr int stageCount = STAGECOUNT;
 #else
-constexpr int stageCount = 2;
+constexpr int stageCount = 3;
 #endif
 
 constexpr int NumCopyThreads = 128;
@@ -52,7 +53,7 @@ struct SharedStorageKV {
 };
 
 // Shared Storage with Aligned addresses.
-#ifdef QINRMEM
+#if defined(QINRMEM) && EXECMODE != 2
 template <class Gemm1Type, class Gemm2Type, class OutputType, class SmemLayoutQ,
           class SmemLayoutK, class SmemLayoutS, class SmemLayoutV,
           class SmemLayoutO,

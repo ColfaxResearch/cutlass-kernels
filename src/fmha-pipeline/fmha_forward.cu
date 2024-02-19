@@ -178,8 +178,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
       make_shape(shape<0>(tileShapeS), shape<1>(tileShapeS), STAGES()));
 
 // We assume V is NOT transposed in memory by default.
-// Currently, we only support V FP16, so only one branch in this code is taken.
-// We have left the other branch in with a view to future work with V FP8.
+// For now, if we enable V FP8, then we will also transpose V offline.
 #ifndef GEMM2FP8
   auto tileShapeV = make_shape(bN{}, bK{});
   auto smemLayoutAtomV =
@@ -260,9 +259,9 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   using MmaTileShape = Layout<Shape<_1, _1, _1>>;
 #endif
 
-#if defined(QINRMEM) && EXECMODE < 2
-  printf("QINRMEM enabled.\n");
+#if defined(QINRMEM) && EXECMODE != 2  
   // USE RS version of GMMA for GEMM-I.
+  // Disabled for non-pipelined version.  
   using TiledMma0 = decltype(cute::make_tiled_mma(
       rs_op_selector_custom<MmaA, MmaB, MmaC, Shape<bM, bN, bK>>(),
       MmaTileShape{}));
@@ -290,8 +289,9 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   // col-major for MI and S_prime (used only for verification).
   Layout gmemLayoutMi = make_layout(make_shape(M, H, B), GenColMajor{});
 
-  // We separate out the warp-specialized kernel using a compiler flag
-
+  // We separate out the warp-specialized and non-pipelined 
+  // versions using a compiler flag.
+  // Default is pipelined and not warp-specialized.
 #if !defined(EXECMODE) || EXECMODE == 0
   // Get the ptr to kernel function.
   void const *kernel = (void const *)fmhaForwardPipelinedNoWspl<
@@ -444,9 +444,7 @@ template <typename PrecType, int HEADDIM>
 void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
                      bool refCheck, bool printValues, bool printDiffs,
                      int nStreams) {
-#ifdef GEMM2FP8
-  // We don't support pure FP8 version yet, so disable for now
-  //using Gemm2Type = cutlass::half_t;
+#ifdef GEMM2FP8  
   using Gemm2Type = PrecType;
 #else
   using Gemm2Type = cutlass::half_t;
@@ -694,18 +692,17 @@ void print_usage() {
       << "Options:\n\n"
       << "  --help                      If specified, displays this usage "
          "statement.\n\n"
-      << "  --prec-type=<int>           1 (default) for FP16, 2 for FP8 hybrid "
-         "(Q and K are FP8 E4M3, V is FP16).\n"
+      << "  --prec-type=<int>           1 for FP16, 2 (default) for FP8 E4M3.\n"         
       << "  --batch-size=<int>          Batch size in multi-head attention "
-         "(default: --batch_size=16).\n"
-      << "  --dim-size=<int>            Full Size of the head dimension "
-         "(before reshape). \n"
-      << "  --head-size=<int>           Size of the head dimension (after "
-         "reshape). \n"
+         "(default=4).\n"
+      << "  --dim-size=<int>            Full size of the head dimension "
+         "before reshape (default=2048).\n"
+      << "  --head-size=<int>           Individual head size "
+         "(default=64).\n"
       << "  --seq-length=<int>          Sequence length in multi-head "
-         "attention for Q (default: --seq_length=1024).\n"
+         "attention for Q (default=4096).\n"
       << "  --iterations=<int>          Number of profiling iterations to "
-         "perform.\n"
+         "perform (default=20).\n"
       << "  --num-cuda-streams=<int>    Number of CUDA streams to use "
          "(default=1).\n"
       << "  --reference-check=<bool>    If true, performs reference check.\n"
@@ -725,16 +722,16 @@ int main(int argc, char const **argv) {
   int seqLength, batchSize, dimSize, iterations, nStreams, kHeadSize, precType;  
 
   bool refCheck, printValues, printDiffs;
-  cmd.get_cmd_line_argument("batch-size", batchSize, 16);
+  cmd.get_cmd_line_argument("batch-size", batchSize, 4);
   cmd.get_cmd_line_argument("dim-size", dimSize, 2048);
   cmd.get_cmd_line_argument("head-size", kHeadSize, 64);
-  cmd.get_cmd_line_argument("seq-length", seqLength, 1024);
+  cmd.get_cmd_line_argument("seq-length", seqLength, 4096);
   cmd.get_cmd_line_argument("iterations", iterations, 20);
   cmd.get_cmd_line_argument("num-cuda-streams", nStreams, 1);
   cmd.get_cmd_line_argument("reference-check", refCheck, false);
   cmd.get_cmd_line_argument("print-values", printValues, false);
   cmd.get_cmd_line_argument("print-diffs", printDiffs, false);
-  cmd.get_cmd_line_argument("prec-type", precType, 1);  
+  cmd.get_cmd_line_argument("prec-type", precType, 2);  
 
   if (nStreams > batchSize) {
     std::cout << "#max no. of cuda streams <= batchSize" << std::endl;

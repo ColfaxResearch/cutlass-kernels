@@ -4,7 +4,7 @@
  **************************************************************************************************/
 
 /*! \file
-    \brief FMHA Attention Example.
+    \brief Driver for the non-pipelined FMHA kernel.
 
 */
 
@@ -186,6 +186,7 @@ fmhaForwardNoPipeline(
   auto tOrP = make_tensor(tSrS.data(), tOrPLayout);
 #endif
 
+
   auto reg2reg = ReorgCFp8toAFp8();
   // Allocate space for per-thread rowMax and rowSum in rmem.
   Tensor rowMax = make_tensor<AccumType>(Shape<Int<2 * size<1>(tSrS)>>{});
@@ -310,23 +311,11 @@ fmhaForwardNoPipeline(
     // Convert Operand A From AccumType [=float] to PrecType [=half_t] before
     // issuing.
     auto tSrSPrec = convert_type<Gemm2Type, AccumType>(tSrS);
-#if 0
-    if (cute::thread0()) {
-         print ("before : \n");
-         print_tensor(tSrS);
-    }
-         __syncthreads();
-#endif
+
 #ifdef GEMM2FP8
     reg2reg(tSrSPrec);
 #endif
-#if 0
-    if (cute::thread0()) {
-         print ("after : \n");
-         print_tensor(tSrSPrec);
-    }
-         __syncthreads();
-#endif
+
     auto tOrP = make_tensor(tSrSPrec.data(), tOrPLayout);
     warpgroup_fence_operand(tSrS);
     cfk::gemm_ldbar(tiledMma1, tOrP, tOrV,
