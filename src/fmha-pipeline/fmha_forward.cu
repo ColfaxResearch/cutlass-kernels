@@ -104,7 +104,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   using bM = Int<kQueriesPerBlock>;
   using bN = Int<kKeysPerBlock>;
   using bK = Int<HEADDIM>;
-#if !defined(EXECMODE) || EXECMODE == NO_PIPE
+#if EXECMODE == 2
   using STAGES = Int<1>;
 #else
   using STAGES = Int<stageCount>;
@@ -260,7 +260,8 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   using MmaTileShape = Layout<Shape<_1, _1, _1>>;
 #endif
 
-#ifdef QINRMEM
+#if defined(QINRMEM) && EXECMODE < 2
+  printf("QINRMEM enabled.\n");
   // USE RS version of GMMA for GEMM-I.
   using TiledMma0 = decltype(cute::make_tiled_mma(
       rs_op_selector_custom<MmaA, MmaB, MmaC, Shape<bM, bN, bK>>(),
@@ -293,7 +294,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
 
 #if !defined(EXECMODE) || EXECMODE == 0
   // Get the ptr to kernel function.
-  void const *kernel = (void const *)fmhaForwardNoPipeline<
+  void const *kernel = (void const *)fmhaForwardPipelinedNoWspl<
       PrecType, MmaC, SoftType, Mma2A, OutputType, TiledMma0, TiledMma1,
       decltype(tmaQ), decltype(tileShapeQ), decltype(gmemLayoutQ),
       decltype(smemLayoutQ), decltype(tmak), decltype(tileShapeK),
@@ -308,20 +309,6 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
 
 #elif EXECMODE == 1
   // Get the ptr to kernel function.
-  void const *kernel = (void const *)fmhaForwardPipelinedNoWspl<
-      PrecType, MmaC, SoftType, Mma2A, OutputType, TiledMma0, TiledMma1,
-      decltype(tmaQ), decltype(tileShapeQ), decltype(gmemLayoutQ),
-      decltype(smemLayoutQ), decltype(tmak), decltype(tileShapeK),
-      decltype(gmemLayoutK), decltype(smemLayoutK), decltype(tileShapeS),
-      decltype(gmemLayoutS), decltype(smemLayoutS), decltype(tmaV),
-      decltype(tileShapeV), decltype(gmemLayoutV), decltype(smemLayoutV),
-      decltype(smemLayoutVt), decltype(tmaO), decltype(tileShapeO),
-      decltype(gmemLayoutO), decltype(smemLayoutO), decltype(gmemLayoutMi),
-      ClusterShape>;
-  auto ctaSize = size(TiledMma0{});
-
-#elif EXECMODE == 2
-
   void const *kernel = (void const *)fmhaForwardPipelinedWspl<
       PrecType, MmaC, SoftType, Mma2A, OutputType, TiledMma0, TiledMma1,
       decltype(tmaQ), decltype(tileShapeQ), decltype(gmemLayoutQ),
@@ -334,6 +321,21 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
       ClusterShape>;
 
   auto ctaSize = size(TiledMma0{}) + NumCopyThreads;
+
+#elif EXECMODE == 2
+  // Get the ptr to kernel function.
+  void const *kernel = (void const *)fmhaForwardNoPipeline<
+      PrecType, MmaC, SoftType, Mma2A, OutputType, TiledMma0, TiledMma1,
+      decltype(tmaQ), decltype(tileShapeQ), decltype(gmemLayoutQ),
+      decltype(smemLayoutQ), decltype(tmak), decltype(tileShapeK),
+      decltype(gmemLayoutK), decltype(smemLayoutK), decltype(tileShapeS),
+      decltype(gmemLayoutS), decltype(smemLayoutS), decltype(tmaV),
+      decltype(tileShapeV), decltype(gmemLayoutV), decltype(smemLayoutV),
+      decltype(smemLayoutVt), decltype(tmaO), decltype(tileShapeO),
+      decltype(gmemLayoutO), decltype(smemLayoutO), decltype(gmemLayoutMi),
+      ClusterShape>;
+
+  auto ctaSize = size(TiledMma0{});
 #endif
 
   //
@@ -483,6 +485,7 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
   cutlass::Distribution::Kind initK;
   cutlass::Distribution::Kind initV;
   if (refCheck) {
+    // Change to Uniform for easier debugging
     // initQ = cutlass::Distribution::Uniform;
     // initK = cutlass::Distribution::Uniform;
     // initV = cutlass::Distribution::Uniform;
@@ -719,8 +722,8 @@ int main(int argc, char const **argv) {
     return;
   }
 
-  int seqLength, batchSize, dimSize, iterations, nStreams, kHeadSize, precType,
-      execType;
+  int seqLength, batchSize, dimSize, iterations, nStreams, kHeadSize, precType;  
+
   bool refCheck, printValues, printDiffs;
   cmd.get_cmd_line_argument("batch-size", batchSize, 16);
   cmd.get_cmd_line_argument("dim-size", dimSize, 2048);
@@ -731,8 +734,7 @@ int main(int argc, char const **argv) {
   cmd.get_cmd_line_argument("reference-check", refCheck, false);
   cmd.get_cmd_line_argument("print-values", printValues, false);
   cmd.get_cmd_line_argument("print-diffs", printDiffs, false);
-  cmd.get_cmd_line_argument("prec-type", precType, 1);
-  cmd.get_cmd_line_argument("exec-type", execType, 1);
+  cmd.get_cmd_line_argument("prec-type", precType, 1);  
 
   if (nStreams > batchSize) {
     std::cout << "#max no. of cuda streams <= batchSize" << std::endl;

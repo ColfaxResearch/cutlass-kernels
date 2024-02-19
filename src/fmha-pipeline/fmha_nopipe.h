@@ -221,54 +221,11 @@ fmhaForwardNoPipeline(
   // Copy first tile of K from GMEM to SMEM.
   cfk::copy(tKgK(_, 0), tKsK(_, 0), tmaLoadK, tma_load_mbar[0], mcast_mask_a);
 
-#ifdef QINRMEM
-  Tensor tSsQ = threadMma0.partition_A(sQ);
-  cfk::copy(tSsQ, tSrQ);
-  cute::cluster_sync();
-#endif
-
-  // mbarrier.init
-  using MainloopPipeline = typename cutlass::PipelineTmaAsync<stageCount>;
-  using PipelineState = typename cutlass::PipelineState<stageCount>;
-  // using BarrierType = typename MainloopPipeline::ProducerBarrierType;
-  // Compute TMA transaction bytes
-  constexpr int per_cta_bytes =
-      size(tileShapeK) * sizeof_bits_v<Gemm1Type> / 8 +
-      size(tileShapeV) * sizeof_bits_v<Gemm2Type> / 8;
-  uint32_t const TmaTransactionBytes = per_cta_bytes;
-  int warp_group_thread_idx = threadIdx.x % 128;
-  // dim3 block_id_in_cluster = cute::block_id_in_cluster();
-
-  typename MainloopPipeline::Params params;
-  params.transaction_bytes = TmaTransactionBytes;
-  params.role = MainloopPipeline::ThreadCategory::ProducerConsumer;
-  params.is_leader = warp_group_thread_idx == 0;
-
-  params.num_consumers = NumMmaThreads;
-  auto cluster_shape = ClusterShape{};
-
-  MainloopPipeline pipeline(shared_storage.storage, params, cluster_shape);
-
-  __syncthreads();
-
-  // Ensure All CTAs in Cluster have completed init before issuing commits
-  cute::cluster_arrive_relaxed();
-  cute::cluster_wait();
-
-  PipelineState smem_pipe_read;
-  // For the DMA (prologue) - we start with an opposite phase - since we skip all waits
-  // i.e., we know that the buffer is indeed empty
-  PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipeline>();
-  PipelineState smem_pipe_release;
-
-  int k_pipe_tma_prologue = 1;
-
-  for(int i = 0; i < k_pipe_tma_prologue; ++i) {
-    pipeline.producer_acquire(smem_pipe_write);
-    // cp.async.bulk.tensor would typically happen here
-    pipeline.producer_commit(smem_pipe_write, per_cta_bytes);
-    ++smem_pipe_write;
-  }
+// don't support QINRMEM for now
+// #ifdef QINRMEM
+//   Tensor tSsQ = threadMma0.partition_A(sQ);
+//   cfk::copy(tSsQ, tSrQ);
+// #endif
 
   // Initialize phase for barriers 0 and 1.
   int phase = 0;
