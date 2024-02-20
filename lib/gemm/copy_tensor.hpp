@@ -92,4 +92,11 @@ __device__ void copy(const TensorA &tA, TensorB &tB) {
   __syncthreads();
 }
 
+
+template <typename TensorA, typename TensorB>
+__device__ void copy_nosync(const TensorA &tA, TensorB &tB) {
+  copy(tA, tB);
+  cutlass::arch::fence_view_async_shared();
+}
+
 } // namespace cfk
