@@ -50,12 +50,14 @@ fmhaForwardConsumer(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V,
 
   // ISSUE GEMM-II with Operand A from RMEM.
   // Convert Operand A from SoftType [=float or half] to Gemm2Type [=half_t or
-  // fp8] before issuing. Gemm2Type = fp8 not yet supported.
+  // fp8] before issuing.
   auto tSrSPrec = convert_type<Gemm2Type, AccumType>(tSrS);
+  // Invoke additional register permute/shuffle if GEMM-II is FP8.
 #ifdef GEMM2FP8
   reg2reg(tSrSPrec);
 #endif
   auto tOrP = make_tensor(tSrSPrec.data(), tOrPLayout);
   warpgroup_fence_operand(tSrS);
+  // Issue GEMM-II.
   cfk::gemm(tiledMma1, tOrP, tOrV, tOrO);
 }
