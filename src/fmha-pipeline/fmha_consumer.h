@@ -42,16 +42,17 @@ fmhaForwardConsumer(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V,
 #endif
 
   if (blockIdxY == 0) { // Compute Online Softmax and NO Output Rescaling.
-    onlineSoftmaxAndRescale<true, SoftType>(rowMax, rowSum, tSrS, tOrO, scale);
+    onlineSoftmaxAndRescale<true, SoftType, Gemm2Type>(rowMax, rowSum, tSrS, tOrO, scale);
   } else { // Compute Online Softmax and Output Rescaling.
-    onlineSoftmaxAndRescale<false, SoftType>(rowMax, rowSum, tSrS, tOrO, scale);
+    onlineSoftmaxAndRescale<false, SoftType, Gemm2Type>(rowMax, rowSum, tSrS, tOrO, scale);
   }
   warpgroup_fence_operand(tSrS);
 
   // ISSUE GEMM-II with Operand A from RMEM.
   // Convert Operand A from SoftType [=float or half] to Gemm2Type [=half_t or
   // fp8] before issuing.
-  auto tSrSPrec = convert_type<Gemm2Type, AccumType>(tSrS);
+  //auto tSrSPrec = convert_type<Gemm2Type, AccumType>(tSrS);
+  auto tSrSPrec = make_tensor(reinterpret_cast<Gemm2Type*>(tSrS.data()), tSrS.layout());
   // Invoke additional register permute/shuffle if GEMM-II is FP8.
 #ifdef GEMM2FP8
   reg2reg(tSrSPrec);

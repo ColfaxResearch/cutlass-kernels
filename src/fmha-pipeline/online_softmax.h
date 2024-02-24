@@ -84,7 +84,7 @@ CUTLASS_DEVICE static void applySoftmaxNormalizer(const Fragment0 &sPrime,
   }
 }
 
-template <bool isFirst, typename AccumType, typename Fragment0,
+template <bool isFirst, typename AccumType, typename OutputType, typename Fragment0,
           typename Fragment1, typename Fragment2, typename Fragment3>
 CUTLASS_DEVICE static void
 onlineSoftmaxAndRescale(Fragment0 &mi, Fragment1 &sPrime, Fragment2 &accum,
@@ -169,6 +169,9 @@ onlineSoftmaxAndRescale(Fragment0 &mi, Fragment1 &sPrime, Fragment2 &accum,
   SumOp<AccumType> sumOp;
   rowId = 0;
   n = 0;
+
+  auto dst_tc_upper = reinterpret_cast<OutputType*>(data);
+  auto dst_tc_lower = dst_tc_upper + 4;
 #pragma unroll
   for (int i = 0; i < MT; ++i) {
     AccumType sum0 = 0.0f;
@@ -176,27 +179,50 @@ onlineSoftmaxAndRescale(Fragment0 &mi, Fragment1 &sPrime, Fragment2 &accum,
     auto miRow0 = mi(rowId);
     auto miRow1 = mi(rowId + 1);
 #pragma unroll
-    for (int k = 0; k < NT * size<2>(VT); ++k) {
+    for (int k = 0; k < NT * size<2>(VT) / 2; ++k) {
 
-      auto val0 = AccumType(data[n]);
-      val0 = exp2f(val0 - miRow0);
-      sum0 += val0;
-      data[n++] = val0;
+      auto val = AccumType(data[n++]);
+      val = exp2f(val - miRow0);
+      sum0 += val;
+      *(dst_tc_upper) = OutputType(val);
 
-      auto val1 = AccumType(data[n]);
-      val1 = exp2f(val1 - miRow0);
-      sum0 += val1;
-      data[n++] = val1;
+      val = AccumType(data[n++]);
+      val = exp2f(val - miRow0);
+      sum0 += val;
+      *(dst_tc_upper+1) = OutputType(val);
 
-      auto val2 = AccumType(data[n]);
-      val2 = exp2f(val2 - miRow1);
-      sum1 += val2;
-      data[n++] = val2;
+      val = AccumType(data[n++]);
+      val = exp2f(val - miRow1);
+      sum1 += val;
+      *(dst_tc_upper+2) = OutputType(val);
 
-      auto val3 = AccumType(data[n]);
-      val3 = exp2f(val3 - miRow1);
-      sum1 += val3;
-      data[n++] = val3;
+      val = AccumType(data[n++]);
+      val = exp2f(val - miRow1);
+      sum1 += val;
+      *(dst_tc_upper+3) = OutputType(val);
+
+      val = AccumType(data[n++]);
+      val = exp2f(val - miRow0);
+      sum0 += val;
+      *(dst_tc_lower) = OutputType(val);
+
+      val = AccumType(data[n++]);
+      val = exp2f(val - miRow0);
+      sum0 += val;
+      *(dst_tc_lower+1) = OutputType(val);
+
+      val = AccumType(data[n++]);
+      val = exp2f(val - miRow1);
+      sum1 += val;
+      *(dst_tc_lower+2) = OutputType(val);
+
+      val = AccumType(data[n++]);
+      val = exp2f(val - miRow1);
+      sum1 += val;
+      *(dst_tc_lower+3) = OutputType(val);
+
+       dst_tc_lower += 8;
+       dst_tc_upper += 8;
     }
     auto sumQuad0 = ShflReduce<4>::run(sum0, sumOp);
     auto sumQuad1 = ShflReduce<4>::run(sum1, sumOp);

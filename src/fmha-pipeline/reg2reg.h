@@ -76,8 +76,8 @@ CUTLASS_DEVICE auto operator()(Fragment &accum) {
   // First update `mi` to the max per-row
   //
   auto VT = shape<0>(accum); // number of vector elements per tile.
-  auto MT = shape<1>(accum); // number of tiles along M.
-  auto NT = shape<2>(accum); // number of tiles along N.
+  auto MT = size<1>(accum); // number of tiles along M.
+  auto NT = size<2>(accum); // number of tiles along N.
 
   auto data = accum.data();
   int n = 0;
@@ -97,7 +97,7 @@ CUTLASS_DEVICE auto operator()(Fragment &accum) {
       auto lower0 = __byte_perm(upper, lower, selectorEx1);      
       upper0 = __shfl_sync(uint32_t(-1),upper0, upper_map[threadIdx.x%4],4);
       lower0 = __shfl_sync(uint32_t(-1),lower0, lower_map[threadIdx.x%4],4);
-  
+ 
       uint32_t *data_32bit = reinterpret_cast<uint32_t *>(&data[n]);
       data_32bit[0] = __byte_perm(upper0, lower0, selectorEx4);
       data_32bit[1] = __byte_perm(upper0, lower0, selectorEx5);
