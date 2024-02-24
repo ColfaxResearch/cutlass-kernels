@@ -170,8 +170,7 @@ onlineSoftmaxAndRescale(Fragment0 &mi, Fragment1 &sPrime, Fragment2 &accum,
   rowId = 0;
   n = 0;
 
-  auto dst_tc_upper = reinterpret_cast<OutputType*>(data);
-  auto dst_tc_lower = dst_tc_upper + 4;
+  auto dst_tc = reinterpret_cast<OutputType*>(data);
 #pragma unroll
   for (int i = 0; i < MT; ++i) {
     AccumType sum0 = 0.0f;
@@ -179,50 +178,29 @@ onlineSoftmaxAndRescale(Fragment0 &mi, Fragment1 &sPrime, Fragment2 &accum,
     auto miRow0 = mi(rowId);
     auto miRow1 = mi(rowId + 1);
 #pragma unroll
-    for (int k = 0; k < NT * size<2>(VT) / 2; ++k) {
+    for (int k = 0; k < NT * size<2>(VT); ++k) {
 
       auto val = AccumType(data[n++]);
       val = exp2f(val - miRow0);
       sum0 += val;
-      *(dst_tc_upper) = OutputType(val);
+      *(dst_tc) = OutputType(val);
 
       val = AccumType(data[n++]);
       val = exp2f(val - miRow0);
       sum0 += val;
-      *(dst_tc_upper+1) = OutputType(val);
+      *(dst_tc+1) = OutputType(val);
 
       val = AccumType(data[n++]);
       val = exp2f(val - miRow1);
       sum1 += val;
-      *(dst_tc_upper+2) = OutputType(val);
+      *(dst_tc+2) = OutputType(val);
 
       val = AccumType(data[n++]);
       val = exp2f(val - miRow1);
       sum1 += val;
-      *(dst_tc_upper+3) = OutputType(val);
+      *(dst_tc+3) = OutputType(val);
 
-      val = AccumType(data[n++]);
-      val = exp2f(val - miRow0);
-      sum0 += val;
-      *(dst_tc_lower) = OutputType(val);
-
-      val = AccumType(data[n++]);
-      val = exp2f(val - miRow0);
-      sum0 += val;
-      *(dst_tc_lower+1) = OutputType(val);
-
-      val = AccumType(data[n++]);
-      val = exp2f(val - miRow1);
-      sum1 += val;
-      *(dst_tc_lower+2) = OutputType(val);
-
-      val = AccumType(data[n++]);
-      val = exp2f(val - miRow1);
-      sum1 += val;
-      *(dst_tc_lower+3) = OutputType(val);
-
-       dst_tc_lower += 8;
-       dst_tc_upper += 8;
+       dst_tc += 4;
     }
     auto sumQuad0 = ShflReduce<4>::run(sum0, sumOp);
     auto sumQuad1 = ShflReduce<4>::run(sum1, sumOp);
