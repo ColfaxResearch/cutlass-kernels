@@ -57,28 +57,32 @@
 // Helper functions for retrieving optimal swizzled layouts
 template <typename PrecType, int DIM> constexpr auto getSmemLayoutK() {
 
-  constexpr int headSizeBytes = sizeof(PrecType) * DIM;
+	constexpr int headSizeBytes = sizeof(PrecType) * DIM;
 
-  if constexpr (headSizeBytes == 32) {
-    return GMMA::Layout_K_SW32_Atom<PrecType>{};
-  } else if constexpr (headSizeBytes == 64) {
-    return GMMA::Layout_K_SW64_Atom<PrecType>{};
-  } else {
-    return GMMA::Layout_K_SW128_Atom<PrecType>{};
-  }
+	if constexpr (headSizeBytes == 32) {
+		return GMMA::Layout_K_SW32_Atom<PrecType>{};
+	} else if constexpr (headSizeBytes == 64) {
+		return GMMA::Layout_K_SW64_Atom<PrecType>{};
+	}  else if constexpr (headSizeBytes == 128) {
+		return GMMA::Layout_K_SW128_Atom<PrecType>{};
+	} else {
+		return GMMA::Layout_K_INTER_Atom<PrecType>{};
+	}
 }
 
 template <typename PrecType, int DIM> constexpr auto getSmemLayoutMN() {
 
-  constexpr int headSizeBytes = sizeof(PrecType) * DIM;
+	constexpr int headSizeBytes = sizeof(PrecType) * DIM;
 
-  if constexpr (headSizeBytes == 32) {
-    return GMMA::Layout_MN_SW32_Atom<PrecType>{};
-  } else if constexpr (headSizeBytes == 64) {
-    return GMMA::Layout_MN_SW64_Atom<PrecType>{};
-  } else {
-    return GMMA::Layout_MN_SW128_Atom<PrecType>{};
-  }
+	if constexpr (headSizeBytes == 32) {
+		return GMMA::Layout_MN_SW32_Atom<PrecType>{};
+	} else if constexpr (headSizeBytes == 64) {
+		return GMMA::Layout_MN_SW64_Atom<PrecType>{};
+	} else if constexpr (headSizeBytes == 128) {
+		return GMMA::Layout_MN_SW128_Atom<PrecType>{};
+	} else {
+		return GMMA::Layout_MN_INTER_Atom<PrecType>{};
+	}
 }
 
 // Host method that prepares the data structures
@@ -172,7 +176,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   // Used only for Second matmul with Q and V.
   auto smemLayoutAtomS =
       cute::conditional_return<is_same_v<MmaA, cutlass::half_t>>(
-          getSmemLayoutK<MmaA, HEADDIM>(), GMMA::Layout_K_SW64_Atom<MmaA>{});
+          getSmemLayoutK<MmaA, bN{}>(), GMMA::Layout_K_INTER_Atom<MmaA>{});
   auto smemLayoutS = tile_to_shape(
       smemLayoutAtomS,
       make_shape(shape<0>(tileShapeS), shape<1>(tileShapeS), STAGES()));
@@ -181,9 +185,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
 // For now, if we enable V FP8, then we will also transpose V offline.
 #ifndef GEMM2FP8
   auto tileShapeV = make_shape(bN{}, bK{});
-  auto smemLayoutAtomV =
-      cute::conditional_return<is_same_v<Mma2B, cutlass::half_t>>(
-          getSmemLayoutK<Mma2B, HEADDIM>(), GMMA::Layout_K_SW64_Atom<Mma2B>{});
+  auto smemLayoutAtomV = getSmemLayoutK<Mma2B, HEADDIM>();
   // For pipelined FMHA, the third dimension for SMEM V is the number of stages.
   auto smemLayoutV = tile_to_shape(
       smemLayoutAtomV,
@@ -203,7 +205,8 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
                                make_stride(bN{}, Int<1>{}, bK{} * bN{})));
 
   auto smemLayoutVtFp8 = tile_to_shape(
-      GMMA::Layout_K_SW64_Atom<Mma2B>{},
+      //GMMA::Layout_K_SW64_Atom<Mma2B>{},
+      getSmemLayoutK<Mma2B, bN{}>(),
       make_shape(shape<0>(tileShapeVt), shape<1>(tileShapeVt), STAGES()));
 
   auto smemLayoutVt =
@@ -380,6 +383,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
         gmemLayoutS, smemLayoutS, nTilesOfK, tensorV, tmaV, tileShapeV,
         gmemLayoutV, smemLayoutV, smemLayoutVt, tensorO, tmaO, tileShapeO,
         gmemLayoutO, smemLayoutO, miOut, sPrimeOut, gmemLayoutMi, scale);
+     cudaMemset ( tensorO, 0, 4);
   }
 }
 
