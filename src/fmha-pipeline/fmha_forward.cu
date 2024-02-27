@@ -381,6 +381,30 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
         gmemLayoutV, smemLayoutV, smemLayoutVt, tensorO, tmaO, tileShapeO,
         gmemLayoutO, smemLayoutO, miOut, sPrimeOut, gmemLayoutMi, scale);
   }
+
+  int blockSizeExp;   // The launch configurator returned block size
+  int minGridSizeExp; // The minimum grid size needed to achieve the
+                   // maximum occupancy for a full device launch
+  cudaOccupancyMaxPotentialBlockSize( &minGridSizeExp, &blockSizeExp,
+                                      kernel, 0, 0);
+
+  // calculate theoretical occupancy
+  int maxActiveBlocks;
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor( &maxActiveBlocks,
+                                                 kernel, ctaSize,
+                                                 0);
+
+  int device;
+  cudaDeviceProp props;
+  cudaGetDevice(&device);
+  cudaGetDeviceProperties(&props, device);
+
+  float occupancy = (maxActiveBlocks * ctaSize / props.warpSize) /
+                    (float)(props.maxThreadsPerMultiProcessor /
+                            props.warpSize);
+
+  printf("Launched blocks of size %d. Minimum Expected Size %d. Max Active Blocks %d. Theoretical occupancy: %f\n",
+         int(ctaSize), blockSizeExp, maxActiveBlocks, occupancy);
 }
 
 // Wrapper function for multiple streams.

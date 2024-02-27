@@ -20,3 +20,4 @@ void set_smem_size(int smem_size, void const* kernel)
 }
 }
 }
+
