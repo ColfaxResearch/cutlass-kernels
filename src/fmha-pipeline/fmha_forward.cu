@@ -63,10 +63,8 @@ template <typename PrecType, int DIM> constexpr auto getSmemLayoutK() {
 		return GMMA::Layout_K_SW32_Atom<PrecType>{};
 	} else if constexpr (headSizeBytes == 64) {
 		return GMMA::Layout_K_SW64_Atom<PrecType>{};
-	}  else if constexpr (headSizeBytes == 128) {
-		return GMMA::Layout_K_SW128_Atom<PrecType>{};
 	} else {
-		return GMMA::Layout_K_INTER_Atom<PrecType>{};
+		return GMMA::Layout_K_SW128_Atom<PrecType>{};
 	}
 }
 
@@ -78,10 +76,8 @@ template <typename PrecType, int DIM> constexpr auto getSmemLayoutMN() {
 		return GMMA::Layout_MN_SW32_Atom<PrecType>{};
 	} else if constexpr (headSizeBytes == 64) {
 		return GMMA::Layout_MN_SW64_Atom<PrecType>{};
-	} else if constexpr (headSizeBytes == 128) {
-		return GMMA::Layout_MN_SW128_Atom<PrecType>{};
 	} else {
-		return GMMA::Layout_MN_INTER_Atom<PrecType>{};
+		return GMMA::Layout_MN_SW128_Atom<PrecType>{};
 	}
 }
 
