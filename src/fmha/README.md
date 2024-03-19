@@ -1,5 +1,7 @@
 # FMHA
 
+NOTE: For the new FP8 and pipelined version, please go to /fmha-pipeline. This legacy version is preserved as companion code to our original paper.
+
 An implementation of the FMHA algorithm based on FlashAttention-2, using CUTLASS/CuTe and built for Hopper (SM90) architecture. Explained in the companion paper "A Case Study in CUDA Kernel Fusion: Implementing FlashAttention-2 on NVIDIA Hopper Architecture using the CUTLASS Library" (https://research.colfax-intl.com/nvidia-hopper-flashattention-2/).
 
 ## Building and Running.
