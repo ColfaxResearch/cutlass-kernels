@@ -378,8 +378,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
         tmak, tileShapeK, gmemLayoutK, smemLayoutK, tensorS, tileShapeS,
         gmemLayoutS, smemLayoutS, nTilesOfK, tensorV, tmaV, tileShapeV,
         gmemLayoutV, smemLayoutV, smemLayoutVt, tensorO, tmaO, tileShapeO,
-        gmemLayoutO, smemLayoutO, miOut, sPrimeOut, gmemLayoutMi, scale);
-     cudaMemset ( tensorO, 0, 4);
+        gmemLayoutO, smemLayoutO, miOut, sPrimeOut, gmemLayoutMi, scale);     
   }
 }
 
