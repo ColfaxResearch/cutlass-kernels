@@ -59,5 +59,15 @@ fmhaForwardConsumer(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V,
   auto tOrP = make_tensor(tSrSPrec.data(), tOrPLayout);
   warpgroup_fence_operand(tSrS);
   // Issue GEMM-II.
+#if 0
+  if (cute::thread0()) {
+        print("\n");
+        print(tOrPLayout);
+        print("\n");
+        print(tOrV.layout());
+        print("\n");
+   }
+#endif
+
   cfk::gemm(tiledMma1, tOrP, tOrV, tOrO);
 }
