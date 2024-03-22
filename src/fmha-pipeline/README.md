@@ -22,9 +22,8 @@ For #ifdef flags:
 1. GEMM2FP8 enables FP8 format for GEMM-II (P.V) in attention. Otherwise, the FP8 version is implemented as a 'hybrid' kernel where the Q and K tensors are FP8, but the V tensor remains FP16. Enabling GEMM2FP8 necessitates transposing V in memory as a pre-processing step prior to launching the kernel. Furthermore, the reported FLOPS with GEMM2FP8 enabled does not include the cost of this transpose as it is done offline.
 2. CTA256 enables 256 threads (=2 warpgroups) per WGMMA.
 3. QINRMEM enables the Q operand in RMEM for GEMM-I. This is always disabled for the non-pipelined version.
-4. GEMM1FP16ACC enables FP16 accumulator for GEMM-I.
+4. GEMM1FP16ACC enables FP16 accumulator for GEMM-I. Not recommended due to severely degraded accuracy of computation (we want float accumulator for softmax).
 5. GEMM2FP16ACC enables FP16 accumulator for GEMM-II.
-6. SOFTFP16 enables FP16 for online-softmax (uses half-precision intrinsics for exp2 and max).
 
 We also have the debugging flags COPYOUTMM0 and COPYOUTMI for validating intermediate steps of the computation. 
 
