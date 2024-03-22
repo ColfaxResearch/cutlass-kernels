@@ -34,14 +34,6 @@ constexpr int NumMmaThreads = 128;
 #include "cutlass/pipeline/pipeline.hpp"
 
 // Shared Storage with Aligned addresses.
-template <class Gemm1Type, class OutputType, class SmemLayoutQ,
-          class SmemLayoutO>
-union SharedStorageQO {
-  cute::array_aligned<Gemm1Type, cute::cosize_v<SmemLayoutQ>> smem_q;
-  cute::array_aligned<OutputType, cute::cosize_v<SmemLayoutO>> smem_o;
-};
-
-// Shared Storage with Aligned addresses.
 template <class Gemm1Type, class Gemm2Type, class SmemLayoutK,
           class SmemLayoutS, class SmemLayoutV>
 struct SharedStorageKV {
@@ -60,7 +52,8 @@ template <class Gemm1Type, class Gemm2Type, class OutputType, class SmemLayoutQ,
           typename ClusterShape = cutlass::gemm::GemmShape<1, 1, 1>>
 struct SharedStorage {
   union {
-    SharedStorageQO<Gemm1Type, OutputType, SmemLayoutQ, SmemLayoutO> qo;
+    cute::array_aligned<Gemm1Type, cute::cosize_v<SmemLayoutQ>> smem_q;
+    cute::array_aligned<OutputType, cute::cosize_v<SmemLayoutO>> smem_o;
     SharedStorageKV<Gemm1Type, Gemm2Type, SmemLayoutK, SmemLayoutS, SmemLayoutV>
         kv;
   };
@@ -76,9 +69,13 @@ template <class Gemm1Type, class Gemm2Type, class OutputType, class SmemLayoutQ,
           typename ClusterShape = cutlass::gemm::GemmShape<1, 1, 1>>
 struct SharedStorage {
   struct {
-    SharedStorageQO<Gemm1Type, OutputType, SmemLayoutQ, SmemLayoutO> qo;
-    SharedStorageKV<Gemm1Type, Gemm2Type, SmemLayoutK, SmemLayoutS, SmemLayoutV>
-        kv;
+    cute::array_aligned<Gemm1Type, cute::cosize_v<SmemLayoutQ>> smem_q;
+    union {
+      SharedStorageKV<Gemm1Type, Gemm2Type, SmemLayoutK, SmemLayoutS,
+                      SmemLayoutV>
+          kv;
+      cute::array_aligned<OutputType, cute::cosize_v<SmemLayoutO>> smem_o;
+    };
   };
   struct {
     cute::uint64_t tma_load_mbar[8]; // 8 TMA barriers pre-allocated for usage.

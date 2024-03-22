@@ -126,9 +126,9 @@ fmhaForwardPipelinedWspl(
 
   // Construct SMEM tensors.
   Tensor sQ =
-      make_tensor(make_smem_ptr(shared_storage.qo.smem_q.data()), smemLayoutQ);
+      make_tensor(make_smem_ptr(shared_storage.smem_q.data()), smemLayoutQ);
   Tensor sO =
-      make_tensor(make_smem_ptr(shared_storage.qo.smem_o.data()), smemLayoutO);
+      make_tensor(make_smem_ptr(shared_storage.smem_o.data()), smemLayoutO);
   Tensor sK =
       make_tensor(make_smem_ptr(shared_storage.kv.smem_k.data()), smemLayoutK);
 #ifdef SINSMEM
