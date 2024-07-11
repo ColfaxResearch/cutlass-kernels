@@ -2,6 +2,10 @@
 
 Library of CUTLASS kernels targeting Large Language Models (LLM).
 
+(07-11-24) The official version of FlashAttention-3 will be maintained at https://github.com/Dao-AILab/flash-attention.
+
+We may upload some variants of the FA3 kernels to this repo from time to time for experimentation purposes, but we don't promise the same level of support here.
+
 # Building 
 
 1. Download CUTLASS following instructions from: https://github.com/NVIDIA/cutlass.
